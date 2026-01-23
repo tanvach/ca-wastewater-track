@@ -7,18 +7,26 @@ A real-time visualization dashboard for tracking viral loads in California waste
 ## 🚀 Features
 
 *   **Multi-Virus Tracking**: Visualizes SARS-CoV-2, Influenza (A/B), RSV, Norovirus, Mpox, and more in a single consolidated chart.
-*   **Adaptive Normalization**:
+*   **PMMoV Normalization**:
+    *   Raw viral counts are normalized by PMMoV (Pepper Mild Mottle Virus), a harmless fecal plant virus, to account for dilution from rainfall and varying water flow.
+*   **Adaptive Baseline**:
     *   Data is normalized to the **% of Peak in the Last 12 Months**.
-    *   This allows impactful comparison between high-load viruses (like Norovirus) and low-load ones (like Respiratory viruses) without ancient outliers distorting recent trends.
+    *   This allows meaningful comparison between high-load viruses (like Norovirus) and low-load ones (like COVID-19) without ancient outliers distorting recent trends.
+*   **Robust Smoothing Algorithm**:
+    *   **Two-Step Filter**: Combines a 5-day rolling median (to remove single-day outliers) followed by a 7-day rolling average (to show clear trends).
+    *   This approach is more resilient to data anomalies than simple averaging.
 *   **Smart Caching**:
     *   To prevent API throttling and improve load times, data is cached in the browser's `localStorage` for 24 hours.
-    *   Data is compressed before storage to stay within browser quota limits.
+    *   Cache is intelligently normalized by city name, so switching between facilities in the same city is instant.
 *   **Interactive Visualization**:
-    *   **7-Day Smoothing**: Reduces daily noise to show clear trends.
+    *   **City Autocomplete**: Search and select from all available wastewater treatment facilities across California.
     *   **Click-to-Isolate**: Click a virus in the legend to hide all others and focus on that specific trend.
-    *   **Recent Spikes**: Automatically detects and highlights the top 3 spiking viruses in the last 7 days.
+    *   **Enhanced Tooltips**: Hover over any data point to see the virus name and percentage in large, bold text.
+    *   **Recent Trends**: Automatically displays the top 3 most active viruses with intensity indicators (Low/Elevated/High Activity).
 *   **Kiosk Mode**:
     *   The dashboard automatically refreshes every 24 hours, making it ideal for always-on displays.
+*   **Dark Mode**: Full dark mode support for comfortable viewing.
+*   **Mobile Optimized**: Responsive design works on phones, tablets, and desktop.
 
 ## 🛠️ Usage
 
