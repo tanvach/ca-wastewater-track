@@ -50,8 +50,8 @@
             justify-content: space-between;
             align-items: flex-start;
             border-bottom: 1px solid var(--border);
-            padding-bottom: 20px;
-            margin-bottom: 20px;
+            padding-bottom: 12px;
+            margin-bottom: 12px;
             flex-wrap: wrap;
             gap: 15px;
         }
@@ -329,7 +329,7 @@
                 /* Ensure panel bg */
                 display: flex;
                 flex-direction: column;
-                gap: 20px;
+                gap: 12px;
             }
 
             .main-content {
@@ -412,7 +412,7 @@
             <div class="header">
                 <div class="title-group">
                     <h1>CA Wastewater Virus Tracker</h1>
-                    <div class="subtitle">Normalized to % of Historical Peak (Smoothed)</div>
+                    <div class="subtitle">Normalized to % of Historical Peak</div>
                     <div class="subtitle" style="font-size: 0.75rem; color: var(--primary);">Auto refreshes daily</div>
                     <div id="cache-status" class="subtitle" style="font-size: 0.75rem; margin-top: 4px; height: 1.2em;">
                     </div>
@@ -449,7 +449,7 @@
                 style="margin-top: auto; padding-top: 20px; border-top: 1px solid var(--border);">
                 <details
                     style="margin-bottom: 20px; font-size: 0.85rem; color: var(--muted); border: 1px solid var(--border); border-radius: 8px; padding: 10px; background: var(--card);">
-                    <summary style="cursor: pointer; font-weight: 600;">ℹ️ How is this calculated?</summary>
+                    <summary style="cursor: pointer; font-weight: 600;">How is this calculated?</summary>
                     <div style="margin-top: 10px; line-height: 1.6;">
                         <ol style="padding-left: 20px; margin: 0;">
                             <li style="margin-bottom: 8px;"><strong>PMMoV Normalization:</strong> We divide the raw
@@ -561,7 +561,7 @@
                         const age = Date.now() - parsed.timestamp;
                         if (age < 1000 * 60 * 60 * 24) { // 24 hours
                             log(`Using cached data (${(age / 3600000).toFixed(1)}h old)`);
-                            const dateStr = new Date(parsed.timestamp).toLocaleString();
+                            const dateStr = new Date(parsed.timestamp).toLocaleString([], { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
                             document.getElementById('cache-status').innerText = `Loaded from cache (${dateStr})`;
                             document.getElementById('cache-status').style.color = '#059669'; // Green-ish
 
@@ -587,7 +587,7 @@
                 if (raw.length === 0) throw new Error("No records found for this city.");
 
                 const nowStr = new Date().toLocaleString();
-                document.getElementById('cache-status').innerText = `📡 Live data fetched (${nowStr})`;
+                document.getElementById('cache-status').innerText = `Live data fetched (${nowStr})`;
                 document.getElementById('cache-status').style.color = '#2563eb'; // Blue
 
                 const cleanData = parseRawData(raw);
