@@ -516,10 +516,23 @@
             const statsRow = document.getElementById('stats-grid');
             statsRow.innerHTML = '';
 
-            // Calculate Max Intensity in LAST 7 DAYS
-            const now = new Date();
-            const sevenDaysAgo = new Date();
-            sevenDaysAgo.setDate(now.getDate() - 7);
+            // Calculate Max Intensity in LAST 7 DAYS of DATA available
+            // 1. Find the latest date in the dataset for this location
+            let lastDataDate = new Date(0);
+            Object.values(virusMap).forEach(rows => {
+                rows.forEach(r => {
+                    if (r.date > lastDataDate) lastDataDate = r.date;
+                });
+            });
+
+            // If no data at all
+            if (lastDataDate.getTime() === 0) {
+                statsRow.innerHTML = '<div style="color:var(--muted); grid-column:1/-1;">No data available.</div>';
+                return;
+            }
+
+            const sevenDaysAgo = new Date(lastDataDate);
+            sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
 
             const spikes = [];
 
@@ -756,7 +769,7 @@
         if (savedMonths) currentMonths = parseInt(savedMonths);
 
         document.getElementById('citySearch').value = savedSearch;
-        document.getElementById('citySearch').value = savedSearch;
+
         fetchData(savedSearch);
 
         // Auto-reload every 24 hours to keep kiosk displays fresh
