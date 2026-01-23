@@ -1181,11 +1181,31 @@
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
-                    interaction: { mode: 'nearest', axis: 'x', intersect: false },
+                    interaction: { mode: 'nearest', intersect: false },
                     plugins: {
                         tooltip: {
+                            mode: 'nearest',
+                            intersect: false,
+                            backgroundColor: 'rgba(0, 0, 0, 0.9)',
+                            titleColor: '#fff',
+                            bodyColor: '#fff',
+                            padding: 12,
+                            cornerRadius: 8,
+                            displayColors: true,
+                            titleFont: {
+                                size: 13,
+                                weight: 'bold'
+                            },
+                            bodyFont: {
+                                size: 18,
+                                weight: 'bold'
+                            },
                             callbacks: {
-                                label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(1)}%`
+                                label: (ctx) => {
+                                    const label = ctx.dataset.label || '';
+                                    const value = ctx.parsed.y.toFixed(1);
+                                    return `${label}: ${value}%`;
+                                }
                             }
                         },
                         legend: {
@@ -1226,6 +1246,23 @@
                         }
                     }
                 }
+            });
+
+            // Handle tooltip dismissal on touch devices
+            const canvas = document.getElementById('canvas');
+            let lastTap = 0;
+            canvas.addEventListener('touchend', (e) => {
+                const currentTime = new Date().getTime();
+                const tapLength = currentTime - lastTap;
+
+                // Double tap to dismiss tooltip
+                if (tapLength < 300 && tapLength > 0) {
+                    chart.setActiveElements([]);
+                    chart.tooltip.setActiveElements([]);
+                    chart.update('none');
+                    e.preventDefault();
+                }
+                lastTap = currentTime;
             });
         }
 
