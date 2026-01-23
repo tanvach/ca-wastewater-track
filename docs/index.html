@@ -77,40 +77,6 @@
             flex-wrap: wrap;
         }
 
-        /* Location Selector */
-        .location-select-container {
-            position: relative;
-        }
-
-        select {
-            appearance: none;
-            background-color: var(--card);
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            padding: 8px 32px 8px 12px;
-            font-size: 0.9rem;
-            color: var(--text);
-            cursor: pointer;
-            box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
-            min-width: 200px;
-        }
-
-        select:focus {
-            outline: 2px solid var(--primary);
-            border-color: var(--primary);
-        }
-
-        .location-select-container::after {
-            content: '';
-            position: absolute;
-            right: 12px;
-            top: 50%;
-            transform: translateY(-50%);
-            border-left: 5px solid transparent;
-            border-right: 5px solid transparent;
-            border-top: 5px solid var(--muted);
-            pointer-events: none;
-        }
 
         .btn-group {
             display: flex;
@@ -203,9 +169,56 @@
             border: 1px solid var(--border);
             border-radius: 6px;
             font-size: 0.9rem;
-            width: 200px;
+            width: 100%;
             background: var(--card);
             color: var(--text);
+            box-sizing: border-box;
+        }
+
+        /* Autocomplete Styles */
+        .autocomplete-container {
+            position: relative;
+            width: 100%;
+        }
+
+        .autocomplete-suggestions {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            margin-top: 4px;
+            max-height: 250px;
+            overflow-y: auto;
+            z-index: 1000;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+            display: none;
+        }
+
+        .suggestion-item {
+            padding: 10px 12px;
+            cursor: pointer;
+            font-size: 0.875rem;
+            border-bottom: 1px solid var(--border);
+            transition: background 0.2s;
+            color: var(--text);
+        }
+
+        .suggestion-item:last-child {
+            border-bottom: none;
+        }
+
+        .suggestion-item:hover,
+        .suggestion-item.active {
+            background: var(--primary);
+            color: white;
+        }
+
+        .suggestion-item .match {
+            font-weight: bold;
+            text-decoration: underline;
         }
 
         /* Stats Grid */
@@ -358,9 +371,16 @@
             .controls-row {
                 flex-direction: column;
                 align-items: stretch;
+                width: 100%;
+            }
+
+            .header {
+                flex-direction: column;
+                align-items: stretch;
             }
 
             .search-box,
+            .autocomplete-container,
             select {
                 width: 100%;
                 min-width: 0;
@@ -416,30 +436,27 @@
                     <h1>CA Wastewater Virus Tracker</h1>
                     <div class="subtitle">Normalized to % of Historical Peak</div>
                     <div class="subtitle" style="font-size: 0.75rem; color: var(--primary);">Auto refreshes daily</div>
-                    <div id="cache-status" class="subtitle" style="font-size: 0.75rem; margin-top: 4px; height: 1.2em;">
-                    </div>
+                    <div id="cache-status" class="subtitle" style="font-size: 0.75rem; margin-top: 4px;"></div>
+                </div>
+            </div>
+
+            <div class="controls-row">
+                <!-- Search -->
+                <div class="autocomplete-container">
+                    <input type="text" id="citySearch" class="search-box" placeholder="Search City (e.g. San Francisco)"
+                        value="San Francisco (Southeast)" autocomplete="off">
+                    <div id="suggestions" class="autocomplete-suggestions"></div>
                 </div>
 
-                <div class="controls-row">
-                    <!-- Search -->
-                    <input type="text" id="citySearch" class="search-box" placeholder="Search City (e.g. San Francisco)"
-                        value="San Francisco" onchange="runNewSearch(this.value)">
 
-                    <!-- Location Picker -->
-                    <div class="location-select-container">
-                        <select id="locationSelect" onchange="changeLocation(this.value)">
-                            <option value="" disabled selected>Select a Facility...</option>
-                        </select>
-                    </div>
 
-                    <!-- Time Range -->
-                    <div class="btn-group">
-                        <button onclick="updateTimeRange(1)">1M</button>
-                        <button onclick="updateTimeRange(3)">3M</button>
-                        <button onclick="updateTimeRange(6)">6M</button>
-                        <button onclick="updateTimeRange(12)" class="active">1Y</button>
-                        <button onclick="updateTimeRange(24)">All</button>
-                    </div>
+                <!-- Time Range -->
+                <div class="btn-group">
+                    <button onclick="updateTimeRange(1)">1M</button>
+                    <button onclick="updateTimeRange(3)" class="active">3M</button>
+                    <button onclick="updateTimeRange(6)">6M</button>
+                    <button onclick="updateTimeRange(12)">1Y</button>
+                    <button onclick="updateTimeRange(24)">All</button>
                 </div>
             </div>
 
@@ -466,9 +483,12 @@
                     </div>
                 </details>
 
-                <div style="display: flex; gap: 20px; align-items: center; flex-wrap: wrap;">
+                <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
                     <button onclick="forceRefresh()" class="refresh-btn">
-                        🔄 Check for Updates
+                        Check for Updates
+                    </button>
+                    <button onclick="toggleDarkMode()" class="refresh-btn" title="Toggle Dark Mode">
+                        🌓 Dark Mode
                     </button>
                     <div style="font-size: 0.8rem; color: var(--muted); font-style: italic;">
                         (Note: CDPH updates data once daily.)
@@ -508,10 +528,6 @@
 
         <!-- Main Content (Hero Chart) -->
         <div class="main-content">
-            <button onclick="toggleDarkMode()" title="Toggle Dark Mode"
-                style="position: absolute; top: 15px; right: 15px; z-index: 50; border: 1px solid var(--border); background: var(--card); border-radius: 8px; padding: 0; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; font-size: 1.2rem; cursor: pointer; box-shadow: 0 2px 5px rgba(0,0,0,0.05);">
-                🌓
-            </button>
             <div class="chart-box">
                 <canvas id="canvas"></canvas>
                 <div id="loading" class="status-overlay">
@@ -534,9 +550,10 @@
 
         // --- 2. State ---
         let fullDataset = [];
-        let uniqueLocations = [];
+        let allAvailableLabels = []; // For autocomplete
         let chart = null;
-        let currentMonths = 12;
+        let currentMonths = 3;
+        let currentQuery = '';
 
         const logEl = document.getElementById('debug');
         function log(msg) {
@@ -567,8 +584,12 @@
             document.getElementById('loading-text').innerText = `Searching for "${query}"...`;
 
             try {
-                const cacheKey = `ww_data_${query}`;
+                // Normalize cache key: extract core location name (before first parenthesis)
+                // "San Francisco (Oceanside)" -> "San Francisco"
+                const normalizedQuery = query.split('(')[0].trim();
+                const cacheKey = `ww_data_${normalizedQuery}`;
                 const cached = localStorage.getItem(cacheKey);
+                const selectedFacility = localStorage.getItem('lastLocation');
 
                 // Check Cache (Expires after 24 hours)
                 if (cached) {
@@ -576,22 +597,29 @@
                         const parsed = JSON.parse(cached);
                         const age = Date.now() - parsed.timestamp;
                         if (age < 1000 * 60 * 60 * 24) { // 24 hours
-                            log(`Using cached data (${(age / 3600000).toFixed(1)}h old)`);
-                            const dateStr = new Date(parsed.timestamp).toLocaleString([], { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-                            document.getElementById('cache-status').innerText = `Loaded from cache (${dateStr})`;
-                            document.getElementById('cache-status').style.color = '#059669'; // Green-ish
-
                             // Rehydrate Dates
                             const rehydrated = parsed.data.map(d => ({ ...d, date: new Date(d.date) }));
-                            initWithData(rehydrated);
-                            return;
+
+                            // Check if selected facility exists in cached data
+                            const uniqueLocations = [...new Set(rehydrated.map(d => d.location))];
+                            if (selectedFacility && uniqueLocations.includes(selectedFacility)) {
+                                log(`Using cached data (${(age / 3600000).toFixed(1)}h old)`);
+                                const dateStr = new Date(parsed.timestamp).toLocaleString([], { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+                                document.getElementById('cache-status').innerText = `Loaded from cache (${dateStr})`;
+                                document.getElementById('cache-status').style.color = '#059669'; // Green-ish
+
+                                initWithData(rehydrated);
+                                return;
+                            }
+                            // Selected facility not in cache, need to fetch
+                            log(`Selected facility "${selectedFacility}" not in cache, fetching...`);
                         }
                     } catch (e) { console.warn("Cache parse failed", e); }
                 }
 
-                // Fetch New
+                // Fetch New - use NORMALIZED query to get all facilities for the city
                 const resourceId = await getResourceId();
-                const url = `${CONFIG.apiBase}/datastore_search?resource_id=${resourceId}&q=${encodeURIComponent(query)}&limit=${CONFIG.limit}`;
+                const url = `${CONFIG.apiBase}/datastore_search?resource_id=${resourceId}&q=${encodeURIComponent(normalizedQuery)}&limit=${CONFIG.limit}`;
 
                 const resp = await fetch(url);
                 const json = await resp.json();
@@ -633,8 +661,9 @@
             const query = document.getElementById('citySearch').value;
             if (!query) return;
 
-            // Clear cache for this query
-            localStorage.removeItem(`ww_data_${query}`);
+            // Clear cache for this query (use normalized key)
+            const normalizedQuery = query.split('(')[0].trim();
+            localStorage.removeItem(`ww_data_${normalizedQuery}`);
             log('Manual refresh: Cache cleared.');
 
             fetchData(query);
@@ -657,15 +686,33 @@
             localStorage.setItem('darkMode', isDark);
 
             // Re-render chart to update grid colors if needed
-            const loc = document.getElementById('locationSelect').value;
-            if (loc) renderChart(loc);
+            if (fullDataset.length > 0) {
+                const uniqueLocations = [...new Set(fullDataset.map(d => d.location))].sort();
+                const saved = localStorage.getItem('lastLocation');
+                const loc = (saved && uniqueLocations.includes(saved)) ? saved : uniqueLocations[0];
+                if (loc) renderChart(loc);
+            }
         }
 
         function initWithData(data) {
             fullDataset = data;
-            // Extract Unique Locations
-            uniqueLocations = [...new Set(fullDataset.map(d => d.location))].sort();
-            populateLocationDropdown();
+            // Auto-render the selected location or first available
+            const uniqueLocations = [...new Set(fullDataset.map(d => d.location))].sort();
+            if (uniqueLocations.length > 0) {
+                const saved = localStorage.getItem('lastLocation');
+                // Check if saved location matches exactly, or find one that contains the search term
+                let loc = null;
+                if (saved && uniqueLocations.includes(saved)) {
+                    loc = saved;
+                } else if (saved) {
+                    // Try to find a facility that starts with the saved query
+                    loc = uniqueLocations.find(l => l.toLowerCase().startsWith(saved.toLowerCase()));
+                }
+                if (!loc) loc = uniqueLocations[0];
+
+                localStorage.setItem('lastLocation', loc);
+                renderChart(loc);
+            }
         }
 
         function parseRawData(raw) {
@@ -687,44 +734,26 @@
         }
 
         // --- 5. UI Logic ---
-        function populateLocationDropdown() {
-            const select = document.getElementById('locationSelect');
-            select.innerHTML = '<option value="" disabled>Select a Facility...</option>';
-
-            uniqueLocations.forEach(loc => {
-                const opt = document.createElement('option');
-                opt.value = loc;
-                opt.innerText = loc;
-                select.appendChild(opt);
-            });
-
-            // Restore Selection logic
-            const saved = localStorage.getItem('lastLocation');
-            if (saved && uniqueLocations.includes(saved)) {
-                select.value = saved;
-                renderChart(saved);
-            } else if (uniqueLocations.length > 0) {
-                select.value = uniqueLocations[0];
-                renderChart(uniqueLocations[0]);
-            }
-        }
 
         function runNewSearch(val) {
             if (!val) return;
+            currentQuery = val;
             localStorage.setItem('lastSearch', val);
+            // Save the selected facility so initWithData can use it
+            localStorage.setItem('lastLocation', val);
             fetchData(val);
-        }
-
-        function changeLocation(loc) {
-            localStorage.setItem('lastLocation', loc);
-            renderChart(loc);
         }
 
         function updateTimeRange(m) {
             currentMonths = m;
             localStorage.setItem('lastMonths', m);
-            const loc = document.getElementById('locationSelect').value;
-            if (loc) renderChart(loc);
+            // Re-render with current data if available
+            if (fullDataset.length > 0) {
+                const uniqueLocations = [...new Set(fullDataset.map(d => d.location))].sort();
+                const saved = localStorage.getItem('lastLocation');
+                const loc = (saved && uniqueLocations.includes(saved)) ? saved : uniqueLocations[0];
+                if (loc) renderChart(loc);
+            }
         }
 
         // --- 6. Stats & Labels ---
@@ -1201,7 +1230,7 @@
         }
 
         // --- Init ---
-        const savedSearch = localStorage.getItem('lastSearch') || 'San Francisco';
+        const savedSearch = localStorage.getItem('lastSearch') || 'San Francisco (Southeast)';
         const savedMonths = localStorage.getItem('lastMonths');
         if (savedMonths) currentMonths = parseInt(savedMonths);
 
@@ -1219,7 +1248,155 @@
         }
 
         document.getElementById('citySearch').value = savedSearch;
+        // Ensure lastLocation is set from savedSearch on first load
+        if (!localStorage.getItem('lastLocation')) {
+            localStorage.setItem('lastLocation', savedSearch);
+        }
         fetchData(savedSearch);
+
+        // --- 8. Autocomplete Logic ---
+        const searchInput = document.getElementById('citySearch');
+        const suggestionsContainer = document.getElementById('suggestions');
+        let activeSuggestionIndex = -1;
+
+        async function fetchAutocompleteLabels() {
+            const cacheKey = 'ww_available_labels';
+            const cached = localStorage.getItem(cacheKey);
+
+            if (cached) {
+                const parsed = JSON.parse(cached);
+                const age = Date.now() - parsed.timestamp;
+                if (age < 1000 * 60 * 60 * 24 * 7) { // 1 week cache
+                    allAvailableLabels = parsed.labels;
+                    return;
+                }
+            }
+
+            try {
+                const resourceId = await getResourceId();
+                const sql = `SELECT DISTINCT "label_name" FROM "${resourceId}" ORDER BY "label_name"`;
+                const url = `${CONFIG.apiBase}/datastore_search_sql?sql=${encodeURIComponent(sql)}`;
+
+                const resp = await fetch(url);
+                const json = await resp.json();
+
+                if (json.success && json.result.records) {
+                    allAvailableLabels = json.result.records.map(r => r.label_name).filter(l => l);
+                    localStorage.setItem(cacheKey, JSON.stringify({
+                        timestamp: Date.now(),
+                        labels: allAvailableLabels
+                    }));
+                }
+            } catch (e) {
+                console.warn("Failed to fetch labels for autocomplete", e);
+            }
+        }
+
+        function renderSuggestions(filtered) {
+            suggestionsContainer.innerHTML = '';
+            if (filtered.length === 0) {
+                suggestionsContainer.style.display = 'none';
+                return;
+            }
+
+            filtered.forEach((label, index) => {
+                const div = document.createElement('div');
+                div.className = 'suggestion-item';
+                if (index === activeSuggestionIndex) div.classList.add('active');
+
+                // Highlight match
+                const inputVal = searchInput.value.toLowerCase();
+                const startIdx = label.toLowerCase().indexOf(inputVal);
+                if (startIdx >= 0) {
+                    const before = label.substring(0, startIdx);
+                    const match = label.substring(startIdx, startIdx + inputVal.length);
+                    const after = label.substring(startIdx + inputVal.length);
+                    div.innerHTML = `${before}<span class="match">${match}</span>${after}`;
+                } else {
+                    div.innerText = label;
+                }
+
+                div.onclick = () => {
+                    searchInput.value = label;
+                    suggestionsContainer.style.display = 'none';
+                    activeSuggestionIndex = -1;
+                    runNewSearch(label);
+                };
+                suggestionsContainer.appendChild(div);
+            });
+            suggestionsContainer.style.display = 'block';
+        }
+
+        searchInput.addEventListener('input', () => {
+            const val = searchInput.value.toLowerCase();
+            activeSuggestionIndex = -1;
+            if (val.length < 2) {
+                suggestionsContainer.style.display = 'none';
+                return;
+            }
+
+            const filtered = allAvailableLabels
+                .filter(l => l.toLowerCase().includes(val))
+                .slice(0, 10); // Limit to top 10
+
+            renderSuggestions(filtered);
+        });
+
+        searchInput.addEventListener('keydown', (e) => {
+            const items = suggestionsContainer.querySelectorAll('.suggestion-item');
+            if (items.length === 0) return;
+
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                activeSuggestionIndex = (activeSuggestionIndex + 1) % items.length;
+                updateActiveSuggestion(items);
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                activeSuggestionIndex = (activeSuggestionIndex - 1 + items.length) % items.length;
+                updateActiveSuggestion(items);
+            } else if (e.key === 'Enter') {
+                if (activeSuggestionIndex >= 0) {
+                    e.preventDefault();
+                    items[activeSuggestionIndex].click();
+                } else {
+                    // Normal behavior: trigger search
+                    runNewSearch(searchInput.value);
+                    suggestionsContainer.style.display = 'none';
+                }
+            } else if (e.key === 'Escape') {
+                suggestionsContainer.style.display = 'none';
+                activeSuggestionIndex = -1;
+            }
+        });
+
+        function updateActiveSuggestion(items) {
+            items.forEach((item, idx) => {
+                item.classList.toggle('active', idx === activeSuggestionIndex);
+                if (idx === activeSuggestionIndex) {
+                    item.scrollIntoView({ block: 'nearest' });
+                }
+            });
+        }
+
+        // Hide suggestions when clicking outside
+        document.addEventListener('click', (e) => {
+            if (!e.target.closest('.autocomplete-container')) {
+                suggestionsContainer.style.display = 'none';
+            }
+        });
+
+        // Show suggestions on focus if there's text
+        searchInput.addEventListener('focus', () => {
+            if (searchInput.value.length >= 2) {
+                const val = searchInput.value.toLowerCase();
+                const filtered = allAvailableLabels
+                    .filter(l => l.toLowerCase().includes(val))
+                    .slice(0, 10);
+                renderSuggestions(filtered);
+            }
+        });
+
+        fetchAutocompleteLabels();
 
         // Auto-reload every 24 hours to keep kiosk displays fresh
         setTimeout(() => location.reload(), 86400000);
