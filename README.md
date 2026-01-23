@@ -2,6 +2,8 @@
 
 A real-time visualization dashboard for tracking viral loads in California wastewater, powered by the [CDPH Open Data API](https://data.ca.gov/dataset/wastewater-surveillance-data-california).
 
+🔗 **Live Dashboard:** [https://tanvach.github.io/ca-wastewater-track/](https://tanvach.github.io/ca-wastewater-track/)
+
 ## 🚀 Features
 
 *   **Multi-Virus Tracking**: Visualizes SARS-CoV-2, Influenza (A/B), RSV, Norovirus, Mpox, and more in a single consolidated chart.
