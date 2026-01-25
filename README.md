@@ -7,8 +7,9 @@ A real-time visualization dashboard for tracking viral loads in California waste
 ## 🚀 Features
 
 *   **Multi-Virus Tracking**: Visualizes SARS-CoV-2, Influenza (A/B), RSV, Norovirus, Mpox, and more in a single consolidated chart.
-*   **PMMoV Normalization**:
-    *   Raw viral counts are normalized by PMMoV (Pepper Mild Mottle Virus), a harmless fecal plant virus, to account for dilution from rainfall and varying water flow.
+*   **Data Normalization**:
+    *   The app supports normalizing viral counts by PMMoV (Pepper Mild Mottle Virus) to account for dilution.
+    *   **Note**: PMMoV data is currently unavailable in the public CA Open Data set for many locations (including San Francisco), so the dashboard automatically falls back to **Raw Concentration** (copies/L).
 *   **Adaptive Baseline**:
     *   Data is normalized to the **% of Peak in the Last 12 Months**.
     *   This allows meaningful comparison between high-load viruses (like Norovirus) and low-load ones (like COVID-19) without ancient outliers distorting recent trends.
@@ -38,6 +39,10 @@ This is a static HTML/JS application with no build steps required.
 ## 📡 Data Source
 
 Data is sourced directly from the California Department of Public Health (CDPH) [CKAN API](https://data.ca.gov/api/3/action/package_show?id=cdph-wastewater-surveillance-data-california).
+
+> [!IMPORTANT]
+> **Dataset Limitations**: This dataset is a subset of the data collected by the [WastewaterSCAN](https://wastewaterscan.org/) project. Crucially, it **does not include PMMoV (fecal normalization) data** for many sites.
+> While ideally all viral data should be normalized by PMMoV to account for rainfall and dilution, this open dataset forces the use of **Raw Viral Concentrations**. Trends remain accurate, but magnitudes may be affected by extreme weather events.
 
 *   **Update Frequency**: The dashboard fetches live data on every load (unless cached).
 *   **Privacy**: All processing happens client-side in your browser.

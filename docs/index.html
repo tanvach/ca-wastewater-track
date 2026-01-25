@@ -505,9 +505,10 @@
                     <summary style="cursor: pointer; font-weight: 600;">How is this calculated?</summary>
                     <div style="margin-top: 10px; line-height: 1.6;">
                         <ol style="padding-left: 20px; margin: 0;">
-                            <li style="margin-bottom: 8px;"><strong>PMMoV Normalization:</strong> We divide the raw
-                                viral count by PMMoV (a harmless fecal plant virus) to account for dilution from
-                                rainfall or changing water flow.</li>
+                            <li style="margin-bottom: 8px;"><strong>Raw Concentration:</strong> We use the raw viral
+                                concentration (copies/L).
+                                Ideally, we would normalize by PMMoV (a harmless fecal plant virus) to account for
+                                dilution, but PMMoV data is unavailable in this specific dataset.</li>
                             <li style="margin-bottom: 8px;"><strong>Robust Smoothing:</strong> We use a two-step filter
                                 (Median then Rolling Average) to remove single-day outliers and show the true trend.
                             </li>
@@ -1082,47 +1083,7 @@
             // 1. Get Location Data
             const locData = fullDataset.filter(d => d.location === locationName);
 
-            // 2. Build PMMoV Map (With Forward Fill)
-            const pmmovRows = locData.filter(d => d.virus === 'PMMoV' || d.virus.toLowerCase().includes('pepper'));
-            const pmmovMap = new Map();
-
-            if (pmmovRows.length > 0) {
-                // Sort by date
-                pmmovRows.sort((a, b) => a.date - b.date);
-
-                // Get date range from ALL data (to cover recent days where PMMoV might be missing)
-                locData.sort((a, b) => a.date - b.date);
-                const startDate = new Date(locData[0].date);
-                const endDate = new Date(locData[locData.length - 1].date);
-
-                // Index known PMMoV values
-                const knownValues = new Map();
-                pmmovRows.forEach(r => {
-                    knownValues.set(r.date.toISOString().split('T')[0], r.val);
-                });
-
-                let lastValid = null;
-                const current = new Date(startDate);
-
-                // Iterate daily to fill gaps
-                while (current <= endDate) {
-                    const k = current.toISOString().split('T')[0];
-                    if (knownValues.has(k)) {
-                        lastValid = knownValues.get(k);
-                    }
-                    if (lastValid !== null) {
-                        pmmovMap.set(k, lastValid);
-                    }
-                    current.setDate(current.getDate() + 1);
-                }
-            }
-
-            const hasPMMoV = pmmovMap.size > 0;
-            if (!hasPMMoV) {
-                // console.warn(`No PMMoV data found for ${locationName}. Falling back to raw concentrations.`);
-            }
-
-            // 3. Filter Viruses (Exclude PMMoV & Pepper)
+            // 2. Filter Viruses (Exclude PMMoV & Pepper if present, though likely absent)
             const targetData = locData
                 .filter(d => d.virus !== 'PMMoV' && !d.virus.toLowerCase().includes('pepper'))
                 .sort((a, b) => a.date - b.date);
@@ -1133,27 +1094,12 @@
                 virusMap[d.virus].push(d);
             });
 
-            // Normalize Data (PMMoV Ratio or Raw Fallback)
+            // 3. Normalize Data (Raw Fallback Only)
             const normalizedVirusMap = {};
             for (const [virus, rows] of Object.entries(virusMap)) {
                 normalizedVirusMap[virus] = rows.map(r => {
-                    const k = r.date.toISOString().split('T')[0];
-                    let val = r.val;
-
-                    // Apply PMMoV Normalization if available
-                    if (hasPMMoV) {
-                        // Use the forward-filled map; if (gap), use lastValid
-                        const pVal = pmmovMap.get(k);
-
-                        if (pVal && pVal > 0) {
-                            val = r.val / pVal;
-                        } else {
-                            // If we STILL don't have a value (e.g. at the start of dataset), drop it.
-                            return null;
-                        }
-                    }
-                    return { date: r.date, val: val, rawConc: r.val };
-                }).filter(n => n !== null);
+                    return { date: r.date, val: r.val, rawConc: r.val };
+                });
             }
 
             // Collections to pass to UpdateStatsUI
