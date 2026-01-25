@@ -305,10 +305,43 @@
             transition: transform 0.2s, box-shadow 0.2s, background-color 0.3s, color 0.3s;
         }
 
-        .stat-card.clickable:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+        @media (hover: hover) {
+            .stat-card.clickable:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+                border-color: var(--primary);
+            }
+        }
+
+        .stat-card.active {
             border-color: var(--primary);
+            box-shadow: 0 0 0 2px var(--primary);
+            /* Ring effect */
+        }
+
+        /* Optional: slight background tint for active */
+        .stat-card.active.stat-high {
+            background-color: rgba(239, 68, 68, 0.05);
+        }
+
+        .stat-card.active.stat-med {
+            background-color: rgba(245, 158, 11, 0.05);
+        }
+
+        .stat-card.active.stat-low {
+            background-color: rgba(16, 185, 129, 0.05);
+        }
+
+        body.dark-mode .stat-card.active.stat-high {
+            background-color: rgba(239, 68, 68, 0.15);
+        }
+
+        body.dark-mode .stat-card.active.stat-med {
+            background-color: rgba(245, 158, 11, 0.15);
+        }
+
+        body.dark-mode .stat-card.active.stat-low {
+            background-color: rgba(16, 185, 129, 0.15);
         }
 
         /* Tablet/Landscape Grid Optimization */
@@ -882,6 +915,8 @@
 
                 const div = document.createElement('div');
                 div.className = `stat-card clickable ${cls}`;
+                div.className = `stat-card clickable ${cls}`;
+                div.setAttribute('data-virus-label', formatLabel(s.virus));
                 div.onclick = () => toggleVirusVisibility(formatLabel(s.virus));
                 div.title = "Click to isolate this virus on the chart";
 
@@ -897,6 +932,9 @@
                 `;
                 statsRow.appendChild(div);
             });
+
+            // Sync initial state
+            updateButtonStates();
         }
 
         function toggleVirusVisibility(labelToToggle) {
@@ -920,6 +958,30 @@
                 });
             }
             chart.update();
+            updateButtonStates();
+        }
+
+        function updateButtonStates() {
+            if (!chart) return;
+
+            const datasets = chart.data.datasets;
+            // Check if exactly ONE dataset is visible
+            const visibleInfos = datasets
+                .map((d, i) => ({ label: d.label, visible: chart.isDatasetVisible(i) }))
+                .filter(info => info.visible);
+
+            const isSingleIsolated = visibleInfos.length === 1;
+
+            const buttons = document.querySelectorAll('.stat-card');
+
+            buttons.forEach(btn => {
+                const btnLabel = btn.getAttribute('data-virus-label');
+                if (isSingleIsolated && visibleInfos[0].label === btnLabel) {
+                    btn.classList.add('active');
+                } else {
+                    btn.classList.remove('active');
+                }
+            });
         }
 
         // --- 6b. Smoothing Helper (Median + Average) ---
@@ -1228,6 +1290,7 @@
                                     ci.data.datasets.forEach((d, i) => { ci.setDatasetVisibility(i, i === index); });
                                 }
                                 ci.update();
+                                updateButtonStates();
                             }
                         }
                     },
