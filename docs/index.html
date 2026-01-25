@@ -1499,8 +1499,77 @@
 
         fetchAutocompleteLabels();
 
-        // Auto-reload every 24 hours to keep kiosk displays fresh
-        setTimeout(() => location.reload(), 86400000);
+        // --- 9. Robust Auto-Refresh Logic (Data Age Based) ---
+        function initAutoRefresh() {
+            const RELOAD_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 24 hours
+            const CHECK_INTERVAL_MS = 5 * 60 * 1000; // Check every 5 minutes
+
+            function checkAndReload() {
+                // 1. Get Current Context
+                const searchInput = document.getElementById('citySearch');
+                const query = searchInput ? searchInput.value : '';
+                if (!query) return;
+
+                // 2. Normalize Key (Match logic in fetchData)
+                const normalizedQuery = query.split('(')[0].trim();
+                const cacheKey = `ww_data_${normalizedQuery}`;
+                const cachedRaw = localStorage.getItem(cacheKey);
+
+                let dataAgeMs = 0;
+                let dataTimestamp = 0;
+
+                if (cachedRaw) {
+                    try {
+                        const parsed = JSON.parse(cachedRaw);
+                        if (parsed.timestamp) {
+                            dataTimestamp = parsed.timestamp;
+                            dataAgeMs = Date.now() - parsed.timestamp;
+                        }
+                    } catch (e) {
+                        console.warn("AutoRefresh: Failed to parse cache", e);
+                    }
+                }
+
+                // Detailed debug logging
+                const hoursOld = (dataAgeMs / 3600000).toFixed(2);
+                log(`AutoRefresh Check: Data is ${hoursOld}h old. Online: ${navigator.onLine}, Hidden: ${document.hidden}`);
+
+                // 3. Decision Logic
+                // If data is older than threshold AND we are online AND the page is visible...
+                if (dataAgeMs > RELOAD_THRESHOLD_MS) {
+                    if (navigator.onLine && !document.hidden) {
+                        log('Data is stale. Refreshing now...');
+                        // Force reload to trigger fetchData -> new API call
+                        location.reload();
+                    } else if (!navigator.onLine) {
+                        log('Data is stale but offline. Waiting for connection...');
+                    } else if (document.hidden) {
+                        log('Data is stale but page hidden. Waiting for visibility...');
+                    }
+                }
+            }
+
+            // 1. Periodic Polling
+            setInterval(checkAndReload, CHECK_INTERVAL_MS);
+
+            // 2. Visibility Change (Immediate check when user comes back)
+            document.addEventListener("visibilitychange", () => {
+                if (document.visibilityState === 'visible') {
+                    log('Tab became visible. Checking refresh status...');
+                    checkAndReload();
+                }
+            });
+
+            // 3. Online Status Change (Immediate check when network returns)
+            window.addEventListener('online', () => {
+                log('Network restored. Checking refresh status...');
+                checkAndReload();
+            });
+
+            log('Auto-refresh system initialized (Data Age mode).');
+        }
+
+        initAutoRefresh();
     </script>
 </body>
 
