@@ -11,7 +11,7 @@ A real-time visualization dashboard for tracking viral loads in California waste
     *   The app supports normalizing viral counts by PMMoV (Pepper Mild Mottle Virus) to account for dilution.
     *   **Note**: PMMoV data is currently unavailable in the public CA Open Data set for many locations (including San Francisco), so the dashboard automatically falls back to **Raw Concentration** (copies/L).
 *   **Adaptive Baseline**:
-    *   Data is normalized to the **% of Peak in the Last 12 Months**.
+    *   Data is normalized to the **% of Peak in the Last 18 Months**.
     *   This allows meaningful comparison between high-load viruses (like Norovirus) and low-load ones (like COVID-19) without ancient outliers distorting recent trends.
 *   **Robust Smoothing Algorithm**:
     *   **Two-Step Filter**: Combines a 5-day rolling median (to remove single-day outliers) followed by a 7-day rolling average (to show clear trends).

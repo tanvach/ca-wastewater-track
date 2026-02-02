@@ -513,7 +513,7 @@
                                 (Median then Rolling Average) to remove single-day outliers and show the true trend.
                             </li>
                             <li style="margin-bottom: 8px;"><strong>% of Peak:</strong> levels are shown as a percentage
-                                of the highest smoothed value observed in the last 12 months.</li>
+                                of the highest smoothed value observed in the last 18 months.</li>
                         </ol>
                     </div>
                 </details>
@@ -538,7 +538,7 @@
                     </label>
                     <label
                         style="font-size: 0.8rem; color: var(--muted); display: flex; align-items: center; gap: 8px; cursor: pointer; margin-left: 20px;">
-                        <input type="checkbox" id="toggleAvg" checked onchange="renderChart()">
+                        <input type="checkbox" id="toggleAvg" checked onchange="toggleSmoothing(this.checked)">
                         Enable Rolling Avg
                     </label>
                 </div>
@@ -711,6 +711,15 @@
                 el.style.display = 'block';
             } else {
                 el.style.display = 'none';
+            }
+        }
+
+        function toggleSmoothing(checked) {
+            localStorage.setItem('enableSmoothing', checked);
+            const saved = localStorage.getItem('lastLocation');
+            // If we have data and a location, re-render
+            if (fullDataset.length > 0 && saved) {
+                renderChart(saved);
             }
         }
 
@@ -1106,7 +1115,7 @@
             const datasets = [];
 
             // Adaptive Baseline
-            const baselineMonths = Math.max(currentMonths, 12);
+            const baselineMonths = Math.max(currentMonths, 18);
             const baselineDate = new Date();
             baselineDate.setMonth(baselineDate.getMonth() - baselineMonths);
 
@@ -1292,6 +1301,15 @@
         if (debugToggle) {
             debugToggle.checked = savedDebug;
             toggleDebug(savedDebug);
+        }
+
+        // Init Smoothing
+        const savedSmoothing = localStorage.getItem('enableSmoothing');
+        const smoothingToggle = document.getElementById('toggleAvg');
+        if (smoothingToggle) {
+            // Default to true if not set
+            const isEnabled = savedSmoothing === null ? true : savedSmoothing === 'true';
+            smoothingToggle.checked = isEnabled;
         }
 
         document.getElementById('citySearch').value = savedSearch;
