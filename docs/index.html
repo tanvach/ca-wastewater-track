@@ -520,8 +520,8 @@
                                 Viruses with no detections in the selected range aren't drawn.</li>
                             <li style="margin-bottom: 8px;"><strong>Robust Smoothing:</strong> We use a two-step filter
                                 (Median then Rolling Average) to remove single-day outliers and show the true trend.
-                                A detection among non-detects is kept, because a rare real detection and a one-off
-                                error look the same.
+                                The median compares detections only with other detections, so a lone detection
+                                among non-detects is kept (it can't be told apart from a one-off error).
                             </li>
                             <li style="margin-bottom: 8px;"><strong>% of Peak:</strong> levels are shown as a percentage
                                 of the highest smoothed value observed in the last 18 months.</li>
@@ -611,21 +611,21 @@
             // Rows per request. The portal caps responses at 50,000 rows, so
             // larger cities (e.g. Santa Clara) are fetched in several pages.
             limit: 50000,
-            // Refuse searches broader than this. The largest city is ~65k
-            // rows; one-word searches like "San" match 140k+.
-            maxRows: 100000,
-            // Columns needed to draw anything; the rest only pick a series. If
-            // the portal rejects the full list (a column was renamed), we retry
-            // with these and plot one series per plant and virus.
-            coreColumns: ['date', 'virus', 'value', 'location'],
+            // Refuse searches that match close to the whole dataset (~430k rows,
+            // e.g. "CA"). The largest city is ~65k rows and grows ~14k a year.
+            maxRows: 250000,
             // "% of peak" baseline and series-selection window.
             baselineMonths: 18,
-            // A series counts as still reporting with data this recent relative
-            // to the newest sample (matches the 14-day staleness of the cards).
+            // A series is "still reporting" with data this recent relative to
+            // the newest sample; stats cards use the same staleness rule.
             currentDays: 14,
+            // How long fetched data is used before it's fetched again.
+            cacheTtlMs: 24 * 60 * 60 * 1000,
             // Bump when the shape or meaning of cached data changes.
-            cachePrefix: 'ww_data_v3_'
+            cachePrefix: 'ww_data_v2_'
         };
+
+        const DAY_MS = 24 * 60 * 60 * 1000;
 
         // A search is made by its core location name, the part before any
         // parenthesis: "San Francisco (Oceanside)" -> "San Francisco". That
@@ -644,11 +644,6 @@
                 .filter(k => k.startsWith('ww_data_') && !keep(k))
                 .forEach(k => localStorage.removeItem(k));
         }
-
-        // Drop city caches written in an older format; they're never read.
-        try {
-            clearCityCaches(k => k.startsWith(CONFIG.cachePrefix));
-        } catch (e) { console.warn(e); }
 
         // Cached rows are stored compactly ([minutes, virus#, location#, value]
         // plus name lists): as plain objects a large city (~65k rows) is bigger
@@ -684,7 +679,6 @@
         let chart = null;
         let currentMonths = 3;
         let currentQuery = '';
-        let labelsPromise = null; // see getLabels()
 
         const logEl = document.getElementById('debug');
         function log(msg) {
@@ -695,20 +689,23 @@
         }
 
         // --- 3. Dynamic Resource Logic ---
-        // A successful lookup is shared by every caller for the rest of the
-        // page's life; a failed one falls back for now and is retried next time.
+        // Looked up once and shared by every caller. If the lookup request
+        // fails, use the fallback for now and try the lookup again next time.
         let resourceIdPromise = null;
         function getResourceId() {
             resourceIdPromise = resourceIdPromise || (async () => {
+                let result;
                 try {
-                    const result = await ckanGet(`${CONFIG.apiBase}/package_show?id=${CONFIG.packageId}`);
-                    // Skip resources without a live datastore: that is how the
-                    // data.ca.gov copy broke (still listed, datastore removed).
-                    const res = (result.resources || []).find(r => r.format === 'CSV' && r.name.includes('Wastewater Surveillance') && r.datastore_active);
-                    if (res) return res.id;
-                } catch (e) { console.warn(e); }
-                resourceIdPromise = null;
-                return CONFIG.fallbackResourceId;
+                    result = await ckanGet(`${CONFIG.apiBase}/package_show?id=${CONFIG.packageId}`);
+                } catch (e) {
+                    console.warn(e);
+                    resourceIdPromise = null;
+                    return CONFIG.fallbackResourceId;
+                }
+                // Skip resources without a live datastore: that is how the
+                // data.ca.gov copy broke (still listed, datastore removed).
+                const res = (result.resources || []).find(r => r.format === 'CSV' && r.name.includes('Wastewater Surveillance') && r.datastore_active);
+                return res ? res.id : CONFIG.fallbackResourceId;
             })();
             return resourceIdPromise;
         }
@@ -741,87 +738,54 @@
             if (!json.success) {
                 const err = json.error || {};
                 const detail = err.message || (Object.keys(err).length ? JSON.stringify(err) : `HTTP ${resp.status}`);
-                throw Object.assign(new Error(`API Error: ${detail}`), { ckan: err });
+                throw new Error(`API Error: ${detail}`);
             }
             return json.result;
         }
 
-        // Fetch every row for a city. Known cities are matched exactly by their
-        // facility labels (`labels`, sent as filters); anything else falls back
-        // to a full-text search, refused if it matches more than CONFIG.maxRows.
-        // The portal caps each response (CONFIG.limit rows): the first page
-        // gives the total and the page size, then the rest are fetched in
-        // parallel. Sorting by _id keeps pages from overlapping or skipping
-        // rows; if the total differs between pages the portal reloaded the
-        // table, so start over rather than mix snapshots. Rows come back as
-        // arrays (records_format=lists, about half the JSON of objects) and are
-        // turned into objects keyed by column name. `signal` cancels requests.
-        // The returned array has `.degraded = true` when series columns were
-        // unavailable, so the caller can avoid caching mixed-series data.
-        async function fetchAllRecords(resourceId, query, labels, onProgress, signal) {
-            const byLabel = labels && labels.length > 0;
-            let columns = Object.values(CONFIG.columns);
-            // Aborted by the caller's signal, or by us if any page fails.
-            const pages = new AbortController();
-            signal?.addEventListener('abort', () => pages.abort());
-            const page = offset => {
-                const params = new URLSearchParams({
-                    resource_id: resourceId,
-                    fields: columns.join(','),
-                    sort: '_id',
-                    records_format: 'lists',
-                    limit: CONFIG.limit,
-                    offset
-                });
-                if (byLabel) params.set('filters', JSON.stringify({ [CONFIG.columns.location]: labels }));
-                else params.set('q', query);
-                return ckanGet(`${CONFIG.apiBase}/datastore_search?${params}`, pages.signal);
-            };
-
+        // Fetch every row matching a search (full-text, as before), one page
+        // at a time: the portal caps each response at CONFIG.limit rows.
+        // Sorting by _id keeps pages from overlapping or skipping rows; if the
+        // total changes between pages the portal reloaded the table, so start
+        // over rather than mix two snapshots. Rows come back as arrays
+        // (records_format=lists, about half the JSON of objects) and are turned
+        // into objects keyed by column name. `signal` cancels the requests.
+        async function fetchAllRecords(resourceId, query, onProgress, signal) {
             for (let attempt = 0; attempt < 2; attempt++) {
-                let first;
-                try {
-                    first = await page(0);
-                } catch (e) {
-                    // A renamed or removed column: plot without series details
-                    // rather than not at all. Labs/sites can't be told apart
-                    // then, so all of a plant's rows for a virus form one series.
-                    if (!e.ckan?.fields || columns.length === CONFIG.coreColumns.length) throw e;
-                    log(`Columns rejected (${JSON.stringify(e.ckan.fields)}); loading without series details (labs not separated).`);
-                    columns = CONFIG.coreColumns.map(c => CONFIG.columns[c]);
-                    first = await page(0);
-                }
-                const total = first.total;
-                if (!byLabel && total > CONFIG.maxRows) {
-                    throw Object.assign(new Error(`"${query}" matches ${total.toLocaleString()} records. Please pick a specific facility from the list.`), { badQuery: true });
-                }
-
-                const step = first.records.length;
-                const offsets = [];
-                for (let o = step; step > 0 && o < total; o += step) offsets.push(o);
-                let loaded = step;
-                if (offsets.length) onProgress?.(loaded, total);
-                const rest = await Promise.all(offsets.map(o => page(o).catch(e => { pages.abort(); throw e; }).then(r => {
-                    loaded += r.records.length;
-                    onProgress?.(Math.min(loaded, total), total);
-                    return r;
-                })));
-                if (rest.some(r => r.total !== total)) {
-                    log('Dataset changed while loading; starting over.');
-                    continue;
-                }
-
                 const records = [];
-                for (const result of [first, ...rest]) {
+                let total = null;
+                let changed = false;
+                while (total === null || records.length < total) {
+                    const params = new URLSearchParams({
+                        resource_id: resourceId,
+                        q: query,
+                        fields: Object.values(CONFIG.columns).join(','),
+                        sort: '_id',
+                        records_format: 'lists',
+                        limit: CONFIG.limit,
+                        offset: records.length
+                    });
+                    const result = await ckanGet(`${CONFIG.apiBase}/datastore_search?${params}`, signal);
+                    if (total === null) {
+                        total = result.total;
+                        if (total > CONFIG.maxRows) {
+                            throw new Error(`"${query}" matches ${total.toLocaleString()} records. Please pick a specific facility from the list.`);
+                        }
+                    } else if (result.total !== total) {
+                        changed = true;
+                        break;
+                    }
                     const names = result.fields.map(f => f.id);
                     for (const row of result.records) {
                         const r = {};
                         names.forEach((name, i) => { r[name] = row[i]; });
                         records.push(r);
                     }
+                    if (result.records.length === 0) break; // shouldn't happen; never loop forever
+                    if (records.length < total) onProgress?.(records.length, total);
                 }
-                records.degraded = columns.length === CONFIG.coreColumns.length;
-                return records;
+                if (!changed) return records;
+                log('Dataset changed while loading; starting over.');
             }
             throw new Error('API Error: the dataset was being updated. Please try again in a minute.');
         }
@@ -843,60 +807,39 @@
 
             try {
                 const normalizedQuery = coreName(query);
-                if (!normalizedQuery) throw Object.assign(new Error('Enter a city or facility name.'), { badQuery: true });
+                if (!normalizedQuery) throw new Error('Enter a city or facility name.');
                 const cacheKey = cacheKeyFor(query);
                 const cached = localStorage.getItem(cacheKey);
-                const selectedFacility = localStorage.getItem('lastLocation');
 
-                // Check Cache (Expires after 24 hours)
+                // Use the cached city if it's fresh and has what was asked for:
+                // the exact facility, or for a bare city name ("Santa Clara")
+                // any of its facilities.
                 if (cached) {
                     try {
                         const parsed = JSON.parse(cached);
                         const age = Date.now() - parsed.timestamp;
-                        if (age < 1000 * 60 * 60 * 24) { // 24 hours
-                            // Check the cached location list before unpacking every row
-                            // A typed city name ("Santa Clara", no facility in
-                            // parentheses) matches its facilities too; a full
-                            // facility label must itself be in the cache.
-                            const cityOnly = selectedFacility && !selectedFacility.includes('(');
-                            const wanted = selectedFacility && coreName(selectedFacility).toLowerCase();
-                            const hit = parsed.data && selectedFacility && parsed.data.location.some(l => l === selectedFacility || (cityOnly && coreName(l).toLowerCase() === wanted));
-                            if (hit) {
-                                const rehydrated = unpackRows(parsed.data);
-                                log(`Using cached data (${(age / 3600000).toFixed(1)}h old)`);
-                                const dateStr = new Date(parsed.timestamp).toLocaleString([], { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-                                document.getElementById('cache-status').innerText = `Loaded from cache (${dateStr})`;
-                                document.getElementById('cache-status').style.color = '#059669'; // Green-ish
+                        if (age < CONFIG.cacheTtlMs && parsed.data.location.some(l => matchesSearch(l, query))) {
+                            log(`Using cached data (${(age / 3600000).toFixed(1)}h old)`);
+                            const dateStr = new Date(parsed.timestamp).toLocaleString([], { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+                            document.getElementById('cache-status').innerText = `Loaded from cache (${dateStr})`;
+                            document.getElementById('cache-status').style.color = '#059669'; // Green-ish
 
-                                initWithData(rehydrated);
-                                return;
-                            }
-                            log(parsed.data ? `Selected facility "${selectedFacility}" not in cache, fetching...` : 'Data was not cached last time, fetching...');
+                            showData(unpackRows(parsed.data), query);
+                            return;
                         }
                     } catch (e) { console.warn("Cache parse failed", e); }
                 }
 
-                // Fetch New - use NORMALIZED query to get all facilities for the city
-                const [resourceId, allLabels] = await Promise.all([getResourceId(), getLabels()]);
-                // Fetch the city's facilities by exact label when we know them
-                // (faster, and can't match unrelated rows); otherwise, or if
-                // the labels found nothing (renamed since the list was cached),
-                // use a full-text search.
-                const labels = allLabels.filter(l => coreName(l).toLowerCase() === normalizedQuery.toLowerCase());
-                if (labels.length && query.includes('(') && !labels.includes(query)) labels.push(query);
-                const onProgress = (done, total) => {
+                // Fetch every facility in the city (by its core name)
+                const resourceId = await getResourceId();
+                const raw = await fetchAllRecords(resourceId, normalizedQuery, (done, total) => {
                     if (seq !== fetchSeq) return;
                     document.getElementById('loading-text').innerText = `Loading ${done.toLocaleString()} of ${total.toLocaleString()} records...`;
                     log(`Fetched ${done} of ${total} records...`);
-                };
-                let raw = await fetchAllRecords(resourceId, normalizedQuery, labels, onProgress, abort.signal);
-                if (raw.length === 0 && labels.length) {
-                    log('No rows for the known labels; trying a full-text search.');
-                    raw = await fetchAllRecords(resourceId, normalizedQuery, null, onProgress, abort.signal);
-                }
+                }, abort.signal);
                 if (seq !== fetchSeq) return; // a newer search started meanwhile
                 log(`Found ${raw.length} records.`);
-                if (raw.length === 0) throw Object.assign(new Error("No records found for this city."), { badQuery: true });
+                if (raw.length === 0) throw new Error("No records found for this city.");
 
                 const nowStr = new Date().toLocaleString();
                 document.getElementById('cache-status').innerText = `Live data fetched (${nowStr})`;
@@ -904,48 +847,46 @@
 
                 const cleanData = parseRawData(raw);
 
-                // Save to Cache (Minimal Data). A city can take a few MB, so if
-                // storage is full, drop other cities' caches and try once more.
-                // Entries that can't fit even in an empty store (Safari allows
-                // ~2.5M characters) aren't attempted, so they can't wipe the
-                // other cities for nothing. If the data isn't cached, a
-                // timestamp-only entry is kept so the daily auto-refresh still
-                // sees when the data was fetched.
-                const entry = JSON.stringify({ timestamp: Date.now(), data: packRows(cleanData) });
-                let cachedOk = false;
-                let notCachedWhy = raw.degraded ? 'loaded without series details' : 'too large';
-                if (!raw.degraded && entry.length <= 2400000) {
-                    notCachedWhy = 'storage full';
-                    try {
-                        localStorage.setItem(cacheKey, entry);
-                        cachedOk = true;
-                    } catch (e) {
-                        try {
-                            clearCityCaches(k => k === cacheKey);
-                            localStorage.setItem(cacheKey, entry);
-                            cachedOk = true;
-                            log('Cache full: cleared other cities to make room.');
-                        } catch (e2) { console.warn("Cache full", e2); }
-                    }
-                }
-                if (!cachedOk) {
-                    log(`Not cached (${notCachedWhy}); it will be fetched again next time.`);
-                    try {
-                        localStorage.setItem(cacheKey, JSON.stringify({ timestamp: Date.now(), data: null }));
-                    } catch (e) { console.warn(e); }
+                // Cache one city at a time: a city is up to ~1.5M characters
+                // packed, and localStorage holds ~2.5M (Safari) to ~5M. If even
+                // that fails, just don't cache (and drop any stale entry).
+                // Other cities are only cleared here, after a successful fetch,
+                // so a failed refresh leaves the expired entry for the
+                // auto-refresh check to keep retrying, as before.
+                try {
+                    clearCityCaches(k => k === cacheKey);
+                    localStorage.setItem(cacheKey, JSON.stringify({ timestamp: Date.now(), data: packRows(cleanData) }));
+                } catch (e) {
+                    console.warn('Not cached', e);
+                    log('Not cached (storage full); it will be fetched again next time.');
+                    try { localStorage.removeItem(cacheKey); } catch (e2) { /* ignore */ }
                 }
 
-                initWithData(cleanData);
-                return 'ok';
+                showData(cleanData, query);
 
             } catch (err) {
-                if (seq !== fetchSeq) return;
+                if (seq !== fetchSeq) return; // superseded (or aborted) by a newer search
                 document.getElementById('error').style.display = 'flex';
                 document.getElementById('error').innerText = err.message;
-                return err.badQuery ? 'badQuery' : 'error';
             } finally {
                 if (seq === fetchSeq) document.getElementById('loading').style.display = 'none';
             }
+        }
+
+        // Does facility label `label` satisfy search `query`? Exactly, or for a
+        // bare city name ("Santa Clara", no facility in parentheses) any of the
+        // city's facilities. Case-insensitive.
+        function matchesSearch(label, query) {
+            const l = label.toLowerCase(), q = query.trim().toLowerCase();
+            if (l === q) return true;
+            return !q.includes('(') && coreName(l) === q;
+        }
+
+        // A search loaded successfully: remember it (only now, so a search
+        // that fails is never saved), and show it.
+        function showData(data, query) {
+            localStorage.setItem('lastSearch', query);
+            initWithData(data, query);
         }
 
         function forceRefresh() {
@@ -993,21 +934,16 @@
             }
         }
 
-        function initWithData(data) {
+        function initWithData(data, query) {
             fullDataset = data;
-            // Auto-render the selected location or first available
+            // Render the searched facility: an exact (case-insensitive) match,
+            // else the first facility starting with the search, else the first.
             const uniqueLocations = [...new Set(fullDataset.map(d => d.location))].sort();
             if (uniqueLocations.length > 0) {
-                const saved = localStorage.getItem('lastLocation');
-                // Check if saved location matches exactly, or find one that contains the search term
-                let loc = null;
-                if (saved && uniqueLocations.includes(saved)) {
-                    loc = saved;
-                } else if (saved) {
-                    // Try to find a facility that starts with the saved query
-                    loc = uniqueLocations.find(l => l.toLowerCase().startsWith(saved.toLowerCase()));
-                }
-                if (!loc) loc = uniqueLocations[0];
+                const q = query.trim().toLowerCase();
+                const loc = uniqueLocations.find(l => l.toLowerCase() === q)
+                    || uniqueLocations.find(l => l.toLowerCase().startsWith(q))
+                    || uniqueLocations[0];
 
                 localStorage.setItem('lastLocation', loc);
                 renderChart(loc);
@@ -1048,7 +984,6 @@
         //      labs don't swap from one day to the next as the window moves;
         //   4. then the most all-time sample days, most recent days, latest data.
         function keepOneSeries(rows) {
-            const DAY = 24 * 60 * 60 * 1000;
             const since = new Date();
             since.setMonth(since.getMonth() - CONFIG.baselineMonths);
 
@@ -1070,7 +1005,7 @@
             for (const [key, bySeries] of stats) {
                 let candidates = [...bySeries].map(([series, s]) => ({ series, ...s }));
                 const newest = Math.max(...candidates.map(c => c.last));
-                candidates = candidates.filter(c => c.last >= newest - CONFIG.currentDays * DAY);
+                candidates = candidates.filter(c => c.last >= newest - CONFIG.currentDays * DAY_MS);
                 const bestRank = Math.max(...candidates.map(c => c.siteRank));
                 candidates = candidates.filter(c => c.siteRank === bestRank);
                 const mostDays = Math.max(...candidates.map(c => c.days.size));
@@ -1083,20 +1018,10 @@
 
         // --- 5. UI Logic ---
 
-        async function runNewSearch(val) {
+        function runNewSearch(val) {
             if (!val) return;
-            const previous = { lastSearch: localStorage.getItem('lastSearch'), lastLocation: localStorage.getItem('lastLocation') };
             currentQuery = val;
-            localStorage.setItem('lastSearch', val);
-            // Save the selected facility so initWithData can use it
-            localStorage.setItem('lastLocation', val);
-            // Don't keep a search that can never load (empty or too broad), or
-            // every reload would show the same error.
-            if (await fetchData(val) === 'badQuery') {
-                for (const [k, v] of Object.entries(previous)) {
-                    if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v);
-                }
-            }
+            fetchData(val); // saved as lastSearch once it loads
         }
 
         function updateTimeRange(m) {
@@ -1203,8 +1128,7 @@
 
                 // Check if data is "recent" (within last 14 days to be safe, though fallback handles gaps)
                 const now = new Date();
-                const diffDays = (now - latestPoint.date) / (1000 * 3600 * 24);
-                // (same staleness rule as series selection: CONFIG.currentDays)
+                const diffDays = (now - latestPoint.date) / DAY_MS;
 
                 // If data is older than 14 days, don't show as a "Recent Spike"
                 if (diffDays > CONFIG.currentDays) continue;
@@ -1350,9 +1274,16 @@
 
             // 3. Pass 1: Rolling Median (Window 5)
             // Trailing Window: -4 to 0 (Current day is 0, look back 4 days)
-            // The median removes one-off spikes, but when most samples are
-            // non-detects (0) it would also erase every real detection, so a
-            // day with a detection keeps its own value instead of a 0 median.
+            // The median removes one-off spikes among detections. Non-detects
+            // (0) neither count toward it nor get replaced by it: a detection
+            // is compared only with other detections (so a rare one among
+            // zeros survives), and a non-detect day stays 0. Days without a
+            // sample are filled from all values in the window, as before.
+            const median = arr => {
+                const a = [...arr].sort((x, y) => x - y);
+                const mid = Math.floor(a.length / 2);
+                return a.length % 2 !== 0 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+            };
             const medianSeries = dense.map((v, i) => {
                 const window = [];
                 for (let j = -4; j <= 0; j++) {
@@ -1360,10 +1291,9 @@
                     if (val !== undefined && val !== null) window.push(val);
                 }
                 if (window.length === 0) return null;
-                window.sort((a, b) => a - b);
-                const mid = Math.floor(window.length / 2);
-                const median = window.length % 2 !== 0 ? window[mid] : (window[mid - 1] + window[mid]) / 2;
-                return (median === 0 && v > 0) ? v : median;
+                if (v === 0) return 0;
+                if (v > 0) return median(window.filter(x => x > 0));
+                return median(window);
             });
 
             // If Rolling Avg is disabled, return Median series directly
@@ -1527,6 +1457,11 @@
                     maintainAspectRatio: false,
                     interaction: { mode: 'nearest', intersect: false },
                     plugins: {
+                        title: {
+                            display: datasets.length === 0,
+                            text: 'No detections in the selected period',
+                            color: textColor
+                        },
                         tooltip: {
                             mode: 'nearest',
                             intersect: false,
@@ -1639,10 +1574,6 @@
         }
 
         document.getElementById('citySearch').value = savedSearch;
-        // Ensure lastLocation is set from savedSearch on first load
-        if (!localStorage.getItem('lastLocation')) {
-            localStorage.setItem('lastLocation', savedSearch);
-        }
         fetchData(savedSearch);
 
         // --- 8. Autocomplete Logic ---
@@ -1650,30 +1581,13 @@
         const suggestionsContainer = document.getElementById('suggestions');
         let activeSuggestionIndex = -1;
 
-        // Facility labels, loaded once and shared by autocomplete and fetchData
-        // (which uses them to fetch a city by exact label). Retried if empty.
-        let labelRetries = 1;
-        function getLabels() {
-            labelsPromise = labelsPromise || fetchAutocompleteLabels()
-                .catch(e => { console.warn('Labels unavailable', e); })
-                .then(() => {
-                    if (!Array.isArray(allAvailableLabels)) allAvailableLabels = [];
-                    // Retry an empty result once on a later search, not every time.
-                    if (!allAvailableLabels.length && labelRetries-- > 0) labelsPromise = null;
-                    return allAvailableLabels;
-                });
-            return labelsPromise;
-        }
-
         async function fetchAutocompleteLabels() {
             const cacheKey = 'ww_available_labels';
             const cached = localStorage.getItem(cacheKey);
 
-            // Refreshed daily (like the city data): fetchData uses these labels
-            // to fetch a city, so a new or renamed facility shows up within a day.
             try {
                 const parsed = cached && JSON.parse(cached);
-                if (parsed && Array.isArray(parsed.labels) && Date.now() - parsed.timestamp < 1000 * 60 * 60 * 24) {
+                if (parsed && Array.isArray(parsed.labels) && Date.now() - parsed.timestamp < 7 * DAY_MS) { // 1 week cache
                     allAvailableLabels = parsed.labels;
                     return;
                 }
@@ -1802,11 +1716,11 @@
             }
         });
 
-        getLabels();
+        fetchAutocompleteLabels();
 
         // --- 9. Robust Auto-Refresh Logic (Data Age Based) ---
         function initAutoRefresh() {
-            const RELOAD_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 24 hours
+            const RELOAD_THRESHOLD_MS = CONFIG.cacheTtlMs;
             const CHECK_INTERVAL_MS = 5 * 60 * 1000; // Check every 5 minutes
 
             function checkAndReload() {
@@ -1819,15 +1733,11 @@
                 const cachedRaw = localStorage.getItem(cacheKeyFor(query));
 
                 let dataAgeMs = 0;
-                let dataTimestamp = 0;
 
                 if (cachedRaw) {
                     try {
                         const parsed = JSON.parse(cachedRaw);
-                        if (parsed.timestamp) {
-                            dataTimestamp = parsed.timestamp;
-                            dataAgeMs = Date.now() - parsed.timestamp;
-                        }
+                        if (parsed.timestamp) dataAgeMs = Date.now() - parsed.timestamp;
                     } catch (e) {
                         console.warn("AutoRefresh: Failed to parse cache", e);
                     }

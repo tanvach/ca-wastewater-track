@@ -20,11 +20,11 @@ A real-time visualization dashboard for tracking viral loads in California waste
     *   Samples where a virus wasn't found are plotted as 0, so a rare detection shows as a brief bump instead of being smoothed into a steady trend. Viruses with no detections in the selected range aren't drawn.
 *   **Robust Smoothing Algorithm**:
     *   **Two-Step Filter**: Combines a 5-day rolling median (to remove single-day outliers) followed by a 7-day rolling average (to show clear trends).
-    *   The median never turns a day with a detection into 0, so detections among mostly-zero samples stay visible. The trade-off: a one-off bad reading among non-detects isn't removed either, since it can't be told apart from a real rare detection.
+    *   The median removes outliers among detections only: a detection is compared with the other detections in its window, non-detect days stay 0, and days without a sample are filled from their neighbors. So a rare detection among non-detects stays visible (the trade-off: a one-off bad reading among non-detects isn't removed either, since the two can't be told apart).
     *   This approach is more resilient to data anomalies than simple averaging.
 *   **Smart Caching**:
     *   To prevent API throttling and improve load times, data is cached in the browser's `localStorage` for 24 hours.
-    *   Cache is intelligently normalized by city name, so switching between facilities in the same city is instant.
+    *   Cache is intelligently normalized by city name, so switching between facilities in the same city is instant. One city is cached at a time (a large city fills a good part of the browser's storage quota).
 *   **Interactive Visualization**:
     *   **City Autocomplete**: Search and select from all available wastewater treatment facilities across California.
     *   **Click-to-Isolate**: Click a virus in the legend to hide all others and focus on that specific trend.
