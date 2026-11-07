@@ -3,8 +3,8 @@ import json
 import collections
 
 # Config
-API_BASE = 'https://data.ca.gov/api/3/action'
-RESOURCE_ID = '49a3fc6f-e52d-4e4a-a9ee-9c9e4a5cc771' # The one we found earlier
+API_BASE = 'https://data.chhs.ca.gov/api/3/action'
+RESOURCE_ID = '2742b824-3736-4292-90a9-7fad98e94c06'
 QUERY = 'San Francisco'
 
 def analyze_data():
@@ -42,8 +42,11 @@ def analyze_data():
 
         # 3. Inspect 'Virus' and 'Value' candidates
         print("--- Value/Virus Columns ---")
-        virus_col = next((k for k in keys if 'target' in k.lower() and 'unit' not in k.lower()), None)
-        value_col = next((k for k in keys if 'conc' in k.lower() or 'copy' in k.lower()), None)
+        # Prefer the known column names; the substring guesses below would
+        # otherwise match earlier keys such as rec_eff_target_name or
+        # concentration_method.
+        virus_col = 'pcr_target' if 'pcr_target' in keys else next((k for k in keys if 'target' in k.lower() and 'unit' not in k.lower()), None)
+        value_col = 'pcr_target_avg_conc' if 'pcr_target_avg_conc' in keys else next((k for k in keys if 'conc' in k.lower() or 'copy' in k.lower()), None)
         
         if virus_col:
             print(f"Virus Column Candidate: {virus_col}")

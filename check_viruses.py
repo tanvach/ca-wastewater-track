@@ -2,24 +2,31 @@ import requests
 import json
 
 # Config
-API_BASE = 'https://data.ca.gov/api/3/action'
-RESOURCE_ID = '49a3fc6f-e52d-4e4a-a9ee-9c9e4a5cc771'
+API_BASE = 'https://data.chhs.ca.gov/api/3/action'
+RESOURCE_ID = '2742b824-3736-4292-90a9-7fad98e94c06'
 QUERY = 'San Francisco'
 
 def check_viruses():
     print(f"Fetching unique viruses for: '{QUERY}'...")
-    # Fetch a large chunk to ensure we see all targets
-    url = f"{API_BASE}/datastore_search?resource_id={RESOURCE_ID}&q={QUERY}&limit=10000"
-    
     try:
-        r = requests.get(url)
-        data = r.json()
-        
-        if not data['success']:
-            print("API Error:", data.get('error'))
-            return
+        # Page through every match: the portal caps each response at 50,000
+        # rows, and a single truncated page can miss targets.
+        records = []
+        while True:
+            r = requests.get(f"{API_BASE}/datastore_search", params={
+                'resource_id': RESOURCE_ID, 'q': QUERY, 'sort': '_id',
+                'limit': 50000, 'offset': len(records)})
+            data = r.json()
 
-        records = data['result']['records']
+            if not data['success']:
+                print("API Error:", data.get('error'))
+                return
+
+            page = data['result']['records']
+            records.extend(page)
+            if not page or len(records) >= data['result']['total']:
+                break
+
         print(f"Fetched {len(records)} records.")
         
         # Find the virus column (likely 'pcr_target' or similar)
