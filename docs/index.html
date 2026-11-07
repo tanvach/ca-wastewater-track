@@ -633,7 +633,7 @@
             cacheTtlMs: 24 * 60 * 60 * 1000,
             // Don't cache entries bigger than this: they can't fit in Safari's
             // ~2.5M-character localStorage, and trying would first clear the
-            // city already cached. (A city is up to ~1.5M characters.)
+            // city already cached. (A city is up to ~1.2M characters.)
             maxCacheChars: 2400000,
             // Bump when the shape or meaning of cached data changes.
             cachePrefix: CACHE_ROOT + 'v4_'
@@ -657,6 +657,16 @@
             Object.keys(localStorage)
                 .filter(k => k.startsWith(CACHE_ROOT) && !keep(k))
                 .forEach(k => localStorage.removeItem(k));
+        }
+
+        // City caches in older formats are never read again: free their space.
+        try {
+            clearCityCaches(k => k.startsWith(CONFIG.cachePrefix));
+        } catch (e) { console.warn(e); }
+
+        // How a data timestamp is shown in the status line.
+        function formatStamp(ms) {
+            return new Date(ms).toLocaleString([], { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
         }
 
         // Cached rows are stored compactly ([minutes, virus#, location#, value]
@@ -854,6 +864,7 @@
             fetchAbort?.abort();
             const abort = fetchAbort = new AbortController();
             let cachedEntry = null; // this city's cache entry, fresh or not (fallback if the fetch fails)
+            let fetched = false;    // the data was fetched; a later error is in showing it
             document.getElementById('loading').style.display = 'flex';
             document.getElementById('error').style.display = 'none';
             document.getElementById('loading-text').innerText = `Searching for "${query}"...`;
@@ -882,9 +893,7 @@
                 }
                 if (cachedRows) {
                     log(`Using cached data (${((Date.now() - cachedAt) / 3600000).toFixed(1)}h old)`);
-                    const dateStr = new Date(cachedAt).toLocaleString([], { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-                    document.getElementById('cache-status').innerText = `Loaded from cache (${dateStr})`;
-                    document.getElementById('cache-status').style.color = '#059669'; // Green-ish
+                    setStatus(`Loaded from cache (${formatStamp(cachedAt)})`, '#059669'); // Green-ish
                     showData(cachedRows, query, cachedAt);
                     return;
                 }
@@ -903,9 +912,9 @@
                 const cleanData = parseRawData(raw);
                 if (cleanData.length === 0) throw queryError("No usable records found for this city.");
                 const fetchedAt = Date.now();
+                fetched = true;
 
-                document.getElementById('cache-status').innerText = `Live data fetched (${new Date(fetchedAt).toLocaleString()})`;
-                document.getElementById('cache-status').style.color = '#2563eb'; // Blue
+                setStatus(`Live data fetched (${new Date(fetchedAt).toLocaleString()})`, '#2563eb'); // Blue
 
                 // Cache it (a city is up to ~1.2M characters packed;
                 // localStorage holds ~2.5M in Safari, ~5M elsewhere). If storage
@@ -943,13 +952,13 @@
                 // Couldn't reach the data (not a bad search): show this city's
                 // cached data, however old, labelled with its date, instead of
                 // an error over nothing. Old data keeps auto-refresh retrying.
-                if (!err.queryError && cachedEntry) {
+                if (!err.queryError && !fetched && cachedEntry) {
                     try {
                         const rows = unpackRows(cachedEntry.data);
-                        const dateStr = new Date(cachedEntry.timestamp).toLocaleString([], { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+                        const dateStr = formatStamp(cachedEntry.timestamp);
                         log(`Refresh failed (${err.message}); showing cached data from ${dateStr}.`);
-                        document.getElementById('cache-status').innerText = `Couldn't refresh: showing data from ${dateStr}`;
-                        document.getElementById('cache-status').style.color = '#b45309'; // Amber
+                        // The reason stays visible on hover, so an outage isn't silent.
+                        setStatus(`Couldn't refresh: showing data from ${dateStr}`, '#b45309', err.message); // Amber
                         showData(rows, query, cachedEntry.timestamp);
                         return;
                     } catch (e) { console.warn("Cached fallback failed", e); }
@@ -962,6 +971,14 @@
             } finally {
                 if (seq === fetchSeq) document.getElementById('loading').style.display = 'none';
             }
+        }
+
+        // The status line under the title; `detail` is shown on hover.
+        function setStatus(text, color, detail = '') {
+            const el = document.getElementById('cache-status');
+            el.innerText = text;
+            el.style.color = color;
+            el.title = detail;
         }
 
         // An error caused by the search itself (not the network or portal).

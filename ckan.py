@@ -24,6 +24,8 @@ def call(action, **params):
         data = r.json()
     except ValueError:
         raise CkanError(f"HTTP {r.status_code}: response is not JSON")
+    if not isinstance(data, dict):
+        raise CkanError(f"HTTP {r.status_code}: unexpected response")
     if not data.get('success'):
         raise CkanError(data.get('error'))
     return data['result']
@@ -33,13 +35,13 @@ def resource_id():
     """The dataset's CSV resource with a live datastore, as the dashboard picks it."""
     try:
         package = call('package_show', id=PACKAGE_ID)
-    except (requests.RequestException, CkanError) as e:
+        for r in package.get('resources') or []:
+            if (isinstance(r, dict) and r.get('format') == 'CSV'
+                    and 'Wastewater Surveillance' in (r.get('name') or '')
+                    and r.get('datastore_active')):
+                return r['id']
+    except (requests.RequestException, CkanError, AttributeError, TypeError) as e:
         print(f"package_show failed ({e}); using the fallback resource id.")
-        return FALLBACK_RESOURCE_ID
-    for r in package.get('resources', []):
-        if (r.get('format') == 'CSV' and 'Wastewater Surveillance' in (r.get('name') or '')
-                and r.get('datastore_active')):
-            return r['id']
     return FALLBACK_RESOURCE_ID
 
 
