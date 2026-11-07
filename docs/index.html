@@ -510,11 +510,11 @@
                                 Ideally, we would normalize by PMMoV (a harmless fecal plant virus) to account for
                                 dilution, but PMMoV data is unavailable in this specific dataset.</li>
                             <li style="margin-bottom: 8px;"><strong>One Series per Line:</strong> Some plants are tested
-                                by more than one lab (in units that can't be compared) or at more than one site. Each
-                                line uses a single lab and site: one that is still reporting, preferring samples taken
-                                at the plant over upstream sites, and among those the one sampled on the most days over
-                                the last 18 months (near-equal counts go to the longer history). Where a lab ran two
-                                assays on the same day, its main assay is used.</li>
+                                by more than one lab (in units that can't be compared), at more than one site, or with
+                                more than one assay. Each line uses a single series: one that is still reporting,
+                                preferring samples taken at the plant over upstream sites, and among those the one
+                                sampled on the most days over the last 18 months (near-equal counts go to the longer
+                                history). A "Recent Trend" card needs at least 8 weeks of that series' history.</li>
                             <li style="margin-bottom: 8px;"><strong>Non-Detects Count:</strong> Samples where the virus
                                 wasn't found count as 0, so a rare detection shows as a brief bump, not a trend.
                                 Viruses with no detections in the selected range aren't drawn.</li>
@@ -587,6 +587,9 @@
 
     <script>
         // --- 1. Config ---
+        // Every city cache key starts with this, in any format version.
+        const CACHE_ROOT = 'ww_data_';
+
         const CONFIG = {
             // The dataset is published on the CalHHS open data portal. data.ca.gov
             // still lists it, but its datastore copy was removed (Nov 2026), so
@@ -595,10 +598,10 @@
             packageId: 'wastewater-surveillance-data-california',
             fallbackResourceId: '2742b824-3736-4292-90a9-7fad98e94c06',
             // Only the columns the dashboard uses. Full rows have ~100 columns
-            // and are ~20x larger to download and parse. lab + units + site
-            // identify which measurement series a row belongs to; assay picks
-            // between a lab's assays where they overlap. These are requested by
-            // name, so if the portal renames one, every search fails with its
+            // and are ~20x larger to download and parse. lab + units + site +
+            // assay identify which measurement series a row belongs to. These
+            // are requested by name, so if the portal renames one, every
+            // search fails with its
             // validation error naming the column: update the name here.
             columns: {
                 date: 'sample_collect_date',
@@ -622,6 +625,10 @@
             // A series is "still reporting" with data this recent relative to
             // the newest sample; stats cards use the same staleness rule.
             currentDays: 14,
+            // A "Recent trend" card needs a series with at least this much
+            // history: "% of peak" means little against a few weeks (e.g. just
+            // after a lab changed assays, which starts a new series).
+            minHistoryDays: 56,
             // How long fetched data is used before it's fetched again.
             cacheTtlMs: 24 * 60 * 60 * 1000,
             // Don't cache entries bigger than this: they can't fit in Safari's
@@ -629,7 +636,7 @@
             // city already cached. (A city is up to ~1.5M characters.)
             maxCacheChars: 2400000,
             // Bump when the shape or meaning of cached data changes.
-            cachePrefix: 'ww_data_v4_'
+            cachePrefix: CACHE_ROOT + 'v4_'
         };
 
         const DAY_MS = 24 * 60 * 60 * 1000;
@@ -648,7 +655,7 @@
         // Remove cached city data, except the entries `keep` returns true for.
         function clearCityCaches(keep) {
             Object.keys(localStorage)
-                .filter(k => k.startsWith('ww_data_') && !keep(k))
+                .filter(k => k.startsWith(CACHE_ROOT) && !keep(k))
                 .forEach(k => localStorage.removeItem(k));
         }
 
@@ -685,10 +692,9 @@
         let allAvailableLabels = []; // For autocomplete
         let chart = null;
         let currentMonths = 3;
-        let currentQuery = '';
         let currentLocation = null; // facility on screen
         let dataTimestamp = 0;      // when the data on screen was fetched
-        let loadFailed = false;     // last load failed with nothing on screen
+        let retryQuery = null;      // search that failed with nothing on screen; auto-refresh retries it
 
         const logEl = document.getElementById('debug');
         function log(msg) {
@@ -704,8 +710,11 @@
         let resourceIdPromise = null;
         function getResourceId() {
             resourceIdPromise = resourceIdPromise || (async () => {
+                // Shared by every search, so it must not hang: give up after 10 s.
+                const timeout = new AbortController();
+                const timer = setTimeout(() => timeout.abort(), 10000);
                 try {
-                    const result = await ckanGet(`${CONFIG.apiBase}/package_show?id=${CONFIG.packageId}`);
+                    const result = await ckanGet(`${CONFIG.apiBase}/package_show?id=${CONFIG.packageId}`, timeout.signal);
                     // Skip resources without a live datastore: that is how the
                     // data.ca.gov copy broke (still listed, datastore removed).
                     const res = (result?.resources || []).find(r => r && r.format === 'CSV' && String(r.name || '').includes('Wastewater Surveillance') && r.datastore_active);
@@ -714,6 +723,8 @@
                     console.warn(e);
                     resourceIdPromise = null;
                     return CONFIG.fallbackResourceId;
+                } finally {
+                    clearTimeout(timer);
                 }
             })();
             return resourceIdPromise;
@@ -813,8 +824,11 @@
         let fetchSeq = 0;
         let fetchAbort = null;
 
-        async function fetchData(query) {
+        // skipCache: fetch fresh data even if the cache is fresh ("Check for
+        // Updates"); the cache entry is only replaced if that succeeds.
+        async function fetchData(query, { skipCache = false } = {}) {
             const seq = ++fetchSeq;
+            retryQuery = null;
             fetchAbort?.abort();
             const abort = fetchAbort = new AbortController();
             document.getElementById('loading').style.display = 'flex';
@@ -825,7 +839,7 @@
                 const normalizedQuery = coreName(query);
                 if (!normalizedQuery) throw queryError('Enter a city or facility name.');
                 const cacheKey = cacheKeyFor(query);
-                const cached = localStorage.getItem(cacheKey);
+                const cached = skipCache ? null : localStorage.getItem(cacheKey);
 
                 // A fresh cache entry holds exactly what a fetch would return
                 // (both are keyed by the city name), so use it. Reading it is
@@ -866,6 +880,7 @@
                 document.getElementById('cache-status').style.color = '#2563eb'; // Blue
 
                 const cleanData = parseRawData(raw);
+                if (cleanData.length === 0) throw queryError("No usable records found for this city.");
                 const fetchedAt = Date.now();
 
                 // Cache one city at a time (a city is up to ~1.5M characters
@@ -890,9 +905,9 @@
                 if (seq !== fetchSeq) return; // superseded (or aborted) by a newer search
                 document.getElementById('error').style.display = 'flex';
                 document.getElementById('error').innerText = err.message;
-                // With nothing on screen, let auto-refresh retry. Not for a bad
-                // search: retrying that can't help.
-                if (!fullDataset.length && !err.queryError) loadFailed = true;
+                // With nothing on screen, let auto-refresh retry this search.
+                // Not for a bad search: retrying that can't help.
+                if (!fullDataset.length && !err.queryError) retryQuery = query;
             } finally {
                 if (seq === fetchSeq) document.getElementById('loading').style.display = 'none';
             }
@@ -903,25 +918,23 @@
             return Object.assign(new Error(message), { queryError: true });
         }
 
-        // A search loaded successfully: remember it (only now, so a search
-        // that fails is never saved), note when its data was fetched (for
-        // auto-refresh), and show it.
+        // A search loaded successfully: show it, note when its data was
+        // fetched (for auto-refresh), and remember it (only now, so a search
+        // that fails is never saved; best-effort, storage may be full).
         function showData(data, query, fetchedAt) {
-            localStorage.setItem('lastSearch', query);
             dataTimestamp = fetchedAt;
-            loadFailed = false;
             initWithData(data, query);
+            try {
+                localStorage.setItem('lastSearch', query);
+            } catch (e) { console.warn('Could not save the search', e); }
         }
 
         function forceRefresh() {
             const query = document.getElementById('citySearch').value;
             if (!query) return;
 
-            // Clear cache for this query
-            localStorage.removeItem(cacheKeyFor(query));
-            log('Manual refresh: Cache cleared.');
-
-            fetchData(query);
+            log('Manual refresh: fetching fresh data.');
+            fetchData(query, { skipCache: true });
         }
 
         function toggleDebug(show) {
@@ -967,6 +980,10 @@
             }
         }
 
+        // 4 significant digits: well below qPCR measurement error, and keeps a
+        // large city's cache entry ~20% smaller.
+        const round4 = v => (v === 0 || !isFinite(v)) ? v : Number(v.toPrecision(4));
+
         // Turn API rows into chart rows. Non-detects (0) are kept as real zeros,
         // so rare detections don't get stretched into a steady trend.
         function parseRawData(raw) {
@@ -976,23 +993,23 @@
                 return {
                     date: new Date(r[cols.date]),
                     virus: r[cols.virus],
-                    val: parseFloat(r[cols.value]),
+                    val: round4(parseFloat(r[cols.value])),
                     location: r[cols.location],
-                    series: `${r[cols.lab]}|${String(r[cols.units] || '').toLowerCase()}|${r[cols.site]}`,
-                    assay: r[cols.assay],
+                    series: `${r[cols.lab]}|${String(r[cols.units] || '').toLowerCase()}|${r[cols.site]}|${r[cols.assay]}`,
                     // Prefer the plant's own influent over upstream manholes.
                     siteRank: siteType === 'wwtp' ? 2 : siteType === 'upstream' ? 0 : 1
                 };
             }).filter(d => !isNaN(d.val) && d.val >= 0 && d.location && !isNaN(d.date.getTime()));
-            return keepOneSeries(rows).map(({ series, siteRank, assay, ...d }) => d);
+            return keepOneSeries(rows).map(({ series, siteRank, ...d }) => d);
         }
 
         // A plant can have several measurement series for one virus: different
         // labs with units that can't be compared (e.g. copies/g dry sludge vs
         // copies/L wastewater), different sampling sites (plant influent vs
-        // upstream manholes). Averaging or alternating them is meaningless, so
-        // for each plant and virus keep one lab+unit+site series, chosen by
-        // narrowing the candidates step by step:
+        // upstream manholes) and different assays (e.g. infa1 vs infa1+infa2
+        // combined, whose values differ). Averaging or alternating them is
+        // meaningless, so for each plant and virus keep one lab+unit+site+assay
+        // series, chosen by narrowing the candidates step by step:
         //   1. still reporting (data within CONFIG.currentDays of the newest sample);
         //   2. plant influent over unlabelled over upstream sites (a series
         //      counts as influent if any of its rows is labelled so);
@@ -1030,48 +1047,14 @@
                 candidates.sort((a, b) => (b.allDays.size - a.allDays.size) || (b.days.size - a.days.size) || (b.last - a.last));
                 chosen.set(key, candidates[0].series);
             }
-            const kept = rows.filter(r => chosen.get(`${r.location}|${r.virus}`) === r.series);
-            return keepOneAssayPerDay(kept);
+            return rows.filter(r => chosen.get(`${r.location}|${r.virus}`) === r.series);
         }
 
-        // A lab can run several assays for one virus (e.g. infa1 and "infa1
-        // and infa2 combined"), whose values differ, so they mustn't be
-        // averaged. On days where more than one reported, keep the series'
-        // main assay (most sample days); on days where only one did (e.g.
-        // after the lab switched assays) use it, so the history continues.
-        function keepOneAssayPerDay(rows) {
-            const keyOf = r => `${r.location}|${r.virus}`;
-            const days = new Map();        // key -> Map(assay -> Set(day))
-            const assaysOnDay = new Map(); // key|day -> Set(assay)
-            for (const r of rows) {
-                const key = keyOf(r), t = r.date.getTime();
-                if (!days.has(key)) days.set(key, new Map());
-                const byAssay = days.get(key);
-                if (!byAssay.has(r.assay)) byAssay.set(r.assay, new Set());
-                byAssay.get(r.assay).add(t);
-                const dk = `${key}|${t}`;
-                if (!assaysOnDay.has(dk)) assaysOnDay.set(dk, new Set());
-                assaysOnDay.get(dk).add(r.assay);
-            }
-            const rank = new Map(); // key -> Map(assay -> rank, 0 = main)
-            for (const [key, byAssay] of days) {
-                const order = [...byAssay].sort((a, b) => (b[1].size - a[1].size) || String(a[0]).localeCompare(String(b[0])));
-                rank.set(key, new Map(order.map(([assay], i) => [assay, i])));
-            }
-            return rows.filter(r => {
-                const key = keyOf(r);
-                const present = assaysOnDay.get(`${key}|${r.date.getTime()}`);
-                if (present.size === 1) return true;
-                const ranks = rank.get(key);
-                return ranks.get(r.assay) === Math.min(...[...present].map(a => ranks.get(a)));
-            });
-        }
 
         // --- 5. UI Logic ---
 
         function runNewSearch(val) {
             if (!val) return;
-            currentQuery = val;
             fetchData(val); // saved as lastSearch once it loads
         }
 
@@ -1469,9 +1452,13 @@
                 // Hide viruses with no detections in the shown range (all-zero
                 // lines carry no information and crowd the legend).
                 if (points.some(p => p.y > 0)) {
-                    // Stats cards cover exactly the drawn viruses
-                    allSmoothedMap[virus] = smoothed;
-                    allPeakMap[virus] = smoothPeak;
+                    // Stats cards cover the drawn viruses whose series has
+                    // enough history for "% of peak" to mean something.
+                    const historyDays = (rows[rows.length - 1].date - rows[0].date) / DAY_MS;
+                    if (historyDays >= CONFIG.minHistoryDays) {
+                        allSmoothedMap[virus] = smoothed;
+                        allPeakMap[virus] = smoothPeak;
+                    }
 
                     const color = getVirusColor(virus);
                     datasets.push({
@@ -1623,6 +1610,7 @@
         }
 
         document.getElementById('citySearch').value = savedSearch;
+        localStorage.removeItem('lastLocation'); // no longer used
         fetchData(savedSearch);
 
         // --- 8. Autocomplete Logic ---
@@ -1774,10 +1762,20 @@
 
             function checkAndReload() {
                 // Age of the data on screen (kept in memory, so other tabs and
-                // the cache don't affect it). If the last load failed with
-                // nothing on screen, keep retrying.
+                // the cache don't affect it).
                 const dataAgeMs = dataTimestamp ? Date.now() - dataTimestamp : 0;
-                const stale = dataTimestamp ? dataAgeMs > RELOAD_THRESHOLD_MS : loadFailed;
+                const stale = dataAgeMs > RELOAD_THRESHOLD_MS;
+                const canAct = navigator.onLine && !document.hidden;
+
+                // A search that failed with nothing on screen: retry that same
+                // search in place (a reload would fall back to the saved one).
+                if (!dataTimestamp && retryQuery) {
+                    if (canAct) {
+                        log(`Last load failed. Retrying "${retryQuery}"...`);
+                        fetchData(retryQuery);
+                    }
+                    return;
+                }
 
                 // Detailed debug logging
                 const hoursOld = (dataAgeMs / 3600000).toFixed(2);
@@ -1786,8 +1784,8 @@
                 // 3. Decision Logic
                 // If data is older than threshold AND we are online AND the page is visible...
                 if (stale) {
-                    if (navigator.onLine && !document.hidden) {
-                        log(dataTimestamp ? 'Data is stale. Refreshing now...' : 'Last load failed. Retrying now...');
+                    if (canAct) {
+                        log('Data is stale. Refreshing now...');
                         // Force reload to trigger fetchData -> new API call
                         location.reload();
                     } else if (!navigator.onLine) {
