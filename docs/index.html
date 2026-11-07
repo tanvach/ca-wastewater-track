@@ -584,17 +584,59 @@
             packageId: 'wastewater-surveillance-data-california',
             fallbackResourceId: '2742b824-3736-4292-90a9-7fad98e94c06',
             // Only the columns the dashboard uses. Full rows have ~100 columns
-            // and are ~20x larger to download and parse.
+            // and are ~20x larger to download and parse. lab + units identify
+            // which lab's measurement series a row belongs to.
             columns: {
                 date: 'sample_collect_date',
                 virus: 'pcr_target',
                 value: 'pcr_target_avg_conc',
-                location: 'label_name'
+                location: 'label_name',
+                lab: 'lab_id',
+                units: 'pcr_target_units'
             },
             // Rows per request. The portal caps responses at 50,000 rows, so
             // larger cities (e.g. Santa Clara) are fetched in several pages.
-            limit: 50000
+            limit: 50000,
+            // Refuse searches broader than this (the largest city is ~65k
+            // rows; a blank or one-word search can match the whole dataset).
+            maxRows: 200000,
+            // Bump when the shape or meaning of cached data changes.
+            cachePrefix: 'ww_data_v2_'
         };
+
+        // Cache key for a search: the core location name before any
+        // parenthesis, so "San Francisco (Oceanside)" -> "San Francisco".
+        function cacheKeyFor(query) {
+            return CONFIG.cachePrefix + query.split('(')[0].trim();
+        }
+
+        // Cached rows are stored compactly ([minutes, virus#, location#, value]
+        // plus name lists): as plain objects a large city (~65k rows) is bigger
+        // than localStorage's ~5 MB limit.
+        function packRows(rows) {
+            const names = { virus: [], location: [] };
+            const index = { virus: new Map(), location: new Map() };
+            const id = (field, value) => {
+                if (!index[field].has(value)) {
+                    index[field].set(value, names[field].length);
+                    names[field].push(value);
+                }
+                return index[field].get(value);
+            };
+            return {
+                ...names,
+                rows: rows.map(d => [d.date.getTime() / 60000, id('virus', d.virus), id('location', d.location), d.val])
+            };
+        }
+
+        function unpackRows(packed) {
+            return packed.rows.map(([minutes, v, l, val]) => ({
+                date: new Date(minutes * 60000),
+                virus: packed.virus[v],
+                location: packed.location[l],
+                val
+            }));
+        }
 
         // --- 2. State ---
         let fullDataset = [];
@@ -618,49 +660,90 @@
                 const resp = await fetch(url);
                 const json = await resp.json();
                 if (json.success && json.result?.resources) {
-                    const res = json.result.resources.find(r => r.format === 'CSV' && r.name.includes('Wastewater Surveillance'));
+                    // Skip resources without a live datastore: that is how the
+                    // data.ca.gov copy broke (still listed, datastore removed).
+                    const res = json.result.resources.find(r => r.format === 'CSV' && r.name.includes('Wastewater Surveillance') && r.datastore_active);
                     if (res) return res.id;
                 }
             } catch (e) { console.warn(e); }
             return CONFIG.fallbackResourceId;
         }
 
-        // Fetch every matching row, one page at a time. Sorting by _id keeps the
-        // order stable so pages neither overlap nor skip rows.
-        async function fetchAllRecords(resourceId, query) {
-            let records = [];
-            while (true) {
-                const params = new URLSearchParams({
-                    resource_id: resourceId,
-                    q: query,
-                    fields: Object.values(CONFIG.columns).join(','),
-                    sort: '_id',
-                    limit: CONFIG.limit,
-                    offset: records.length
-                });
-                const resp = await fetch(`${CONFIG.apiBase}/datastore_search?${params}`);
-                const json = await resp.json();
-
-                if (!json.success) throw new Error(`API Error: ${json.error?.message || resp.status}`);
-
-                const page = json.result.records;
-                records = records.concat(page);
-                if (page.length === 0 || records.length >= json.result.total) return records;
-                log(`Fetched ${records.length} of ${json.result.total} records...`);
+        // GET a CKAN action URL and return its `result`, or throw an Error that
+        // carries the portal's own reason (CKAN validation errors have no
+        // `message`, and proxies/CDNs can answer with non-JSON pages).
+        async function ckanGet(url) {
+            let resp;
+            try {
+                resp = await fetch(url);
+            } catch (e) {
+                throw new Error(`Network error: couldn't reach the data portal (${e.message}).`);
             }
+            let json;
+            try {
+                json = await resp.json();
+            } catch (e) {
+                throw new Error(`API Error: HTTP ${resp.status} ${resp.statusText}`.trim());
+            }
+            if (!json.success) {
+                const err = json.error || {};
+                const detail = err.message || (Object.keys(err).length ? JSON.stringify(err) : `HTTP ${resp.status}`);
+                throw new Error(`API Error: ${detail}`);
+            }
+            return json.result;
+        }
+
+        // Fetch every matching row, one page at a time (the portal caps each
+        // response at CONFIG.limit rows). Sorting by _id keeps pages from
+        // overlapping or skipping rows; if the total changes between pages the
+        // portal reloaded the table, so start over rather than mix snapshots.
+        async function fetchAllRecords(resourceId, query, onProgress) {
+            for (let attempt = 0; attempt < 2; attempt++) {
+                const records = [];
+                let total = null;
+                while (true) {
+                    const params = new URLSearchParams({
+                        resource_id: resourceId,
+                        q: query,
+                        fields: Object.values(CONFIG.columns).join(','),
+                        sort: '_id',
+                        limit: CONFIG.limit,
+                        offset: records.length
+                    });
+                    const result = await ckanGet(`${CONFIG.apiBase}/datastore_search?${params}`);
+                    if (total === null) {
+                        total = result.total;
+                        if (total > CONFIG.maxRows) {
+                            throw new Error(`"${query}" matches ${total.toLocaleString()} records. Please pick a specific facility from the list.`);
+                        }
+                    } else if (result.total !== total) {
+                        break;
+                    }
+                    for (const r of result.records) records.push(r);
+                    if (result.records.length === 0 || records.length >= total) return records;
+                    onProgress?.(records.length, total);
+                }
+                log('Dataset changed while loading; starting over.');
+            }
+            throw new Error('API Error: the dataset was being updated. Please try again in a minute.');
         }
 
         // --- 4. Main Data Fetch (With Caching) ---
+        // Each fetchData call takes a number; only the latest call may render,
+        // so a slow earlier search can't overwrite a newer one.
+        let fetchSeq = 0;
+
         async function fetchData(query) {
+            const seq = ++fetchSeq;
             document.getElementById('loading').style.display = 'flex';
             document.getElementById('error').style.display = 'none';
             document.getElementById('loading-text').innerText = `Searching for "${query}"...`;
 
             try {
-                // Normalize cache key: extract core location name (before first parenthesis)
-                // "San Francisco (Oceanside)" -> "San Francisco"
+                // Fetch by the core location name to get every facility in the city.
                 const normalizedQuery = query.split('(')[0].trim();
-                const cacheKey = `ww_data_${normalizedQuery}`;
+                if (!normalizedQuery) throw new Error('Enter a city or facility name.');
+                const cacheKey = cacheKeyFor(query);
                 const cached = localStorage.getItem(cacheKey);
                 const selectedFacility = localStorage.getItem('lastLocation');
 
@@ -670,8 +753,7 @@
                         const parsed = JSON.parse(cached);
                         const age = Date.now() - parsed.timestamp;
                         if (age < 1000 * 60 * 60 * 24) { // 24 hours
-                            // Rehydrate Dates
-                            const rehydrated = parsed.data.map(d => ({ ...d, date: new Date(d.date) }));
+                            const rehydrated = unpackRows(parsed.data);
 
                             // Check if selected facility exists in cached data
                             const uniqueLocations = [...new Set(rehydrated.map(d => d.location))];
@@ -692,7 +774,12 @@
 
                 // Fetch New - use NORMALIZED query to get all facilities for the city
                 const resourceId = await getResourceId();
-                const raw = await fetchAllRecords(resourceId, normalizedQuery);
+                const raw = await fetchAllRecords(resourceId, normalizedQuery, (done, total) => {
+                    if (seq !== fetchSeq) return;
+                    document.getElementById('loading-text').innerText = `Loading ${done.toLocaleString()} of ${total.toLocaleString()} records...`;
+                    log(`Fetched ${done} of ${total} records...`);
+                });
+                if (seq !== fetchSeq) return; // a newer search started meanwhile
                 log(`Found ${raw.length} records.`);
                 if (raw.length === 0) throw new Error("No records found for this city.");
 
@@ -702,24 +789,33 @@
 
                 const cleanData = parseRawData(raw);
 
-                // Save to Cache (Minimal Data)
+                // Save to Cache (Minimal Data). A city can take several MB, so if
+                // storage is full, drop other cities' (and old-format) caches
+                // and try once more.
+                const entry = JSON.stringify({ timestamp: Date.now(), data: packRows(cleanData) });
                 try {
-                    localStorage.setItem(cacheKey, JSON.stringify({
-                        timestamp: Date.now(),
-                        data: cleanData
-                    }));
+                    localStorage.setItem(cacheKey, entry);
                 } catch (e) {
-                    console.warn("Cache full", e);
-                    log("Warning: Cache full, performance may degrade on reload.");
+                    try {
+                        Object.keys(localStorage)
+                            .filter(k => k.startsWith('ww_data_') && k !== cacheKey)
+                            .forEach(k => localStorage.removeItem(k));
+                        localStorage.setItem(cacheKey, entry);
+                        log('Cache full: cleared other cities to make room.');
+                    } catch (e2) {
+                        console.warn("Cache full", e2);
+                        log("Warning: Cache full, performance may degrade on reload.");
+                    }
                 }
 
                 initWithData(cleanData);
 
             } catch (err) {
+                if (seq !== fetchSeq) return;
                 document.getElementById('error').style.display = 'flex';
                 document.getElementById('error').innerText = err.message;
             } finally {
-                document.getElementById('loading').style.display = 'none';
+                if (seq === fetchSeq) document.getElementById('loading').style.display = 'none';
             }
         }
 
@@ -727,9 +823,8 @@
             const query = document.getElementById('citySearch').value;
             if (!query) return;
 
-            // Clear cache for this query (use normalized key)
-            const normalizedQuery = query.split('(')[0].trim();
-            localStorage.removeItem(`ww_data_${normalizedQuery}`);
+            // Clear cache for this query
+            localStorage.removeItem(cacheKeyFor(query));
             log('Manual refresh: Cache cleared.');
 
             fetchData(query);
@@ -790,14 +885,54 @@
             }
         }
 
+        // Turn API rows into chart rows. Non-detects (0) are kept as real zeros,
+        // so rare detections don't get stretched into a steady trend.
         function parseRawData(raw) {
             const cols = CONFIG.columns;
-            return raw.map(r => ({
+            const rows = raw.map(r => ({
                 date: new Date(r[cols.date]),
                 virus: r[cols.virus],
                 val: parseFloat(r[cols.value]),
-                location: r[cols.location]
-            })).filter(d => !isNaN(d.val) && d.val > 0 && d.location);
+                location: r[cols.location],
+                series: `${r[cols.lab]}|${String(r[cols.units] || '').toLowerCase()}`
+            })).filter(d => !isNaN(d.val) && d.val >= 0 && d.location);
+            return keepOneSeries(rows).map(({ series, ...d }) => d);
+        }
+
+        // Some plants are measured by more than one lab, in units that can't be
+        // compared (e.g. copies/g dry sludge vs copies/L wastewater). For each
+        // plant and virus keep one lab's series: among labs still reporting
+        // (data within 30 days of the newest sample), the one that sampled on
+        // the most days in the last 18 months (days, not rows: some labs send
+        // several rows per sample); ties go to the most recent data.
+        function keepOneSeries(rows) {
+            const DAY = 24 * 60 * 60 * 1000;
+            const since = new Date();
+            since.setMonth(since.getMonth() - 18);
+
+            const stats = new Map(); // "location|virus" -> Map(series -> { days, last })
+            for (const r of rows) {
+                const key = `${r.location}|${r.virus}`;
+                if (!stats.has(key)) stats.set(key, new Map());
+                const bySeries = stats.get(key);
+                const s = bySeries.get(r.series) || { days: new Set(), last: 0 };
+                if (r.date >= since) s.days.add(r.date.getTime());
+                s.last = Math.max(s.last, r.date.getTime());
+                bySeries.set(r.series, s);
+            }
+
+            const chosen = new Map();
+            for (const [key, bySeries] of stats) {
+                const newest = Math.max(...[...bySeries.values()].map(s => s.last));
+                const current = s => (s.last >= newest - 30 * DAY ? 1 : 0);
+                const compare = (a, b) => (current(a) - current(b)) || (a.days.size - b.days.size) || (a.last - b.last);
+                let best = null;
+                for (const [series, s] of bySeries) {
+                    if (!best || compare(s, best.s) > 0) best = { series, s };
+                }
+                chosen.set(key, best.series);
+            }
+            return rows.filter(r => chosen.get(`${r.location}|${r.virus}`) === r.series);
         }
 
         // --- 5. UI Logic ---
@@ -1037,8 +1172,17 @@
                 return `${year}-${month}-${day}`;
             };
 
-            const valMap = new Map();
-            rows.forEach(r => valMap.set(toKey(r.date), r.val));
+            // Average same-day samples (one lab can report several per day), so
+            // the value doesn't depend on which row happened to come last.
+            const daySums = new Map();
+            rows.forEach(r => {
+                const k = toKey(r.date);
+                const d = daySums.get(k) || { sum: 0, n: 0 };
+                d.sum += r.val;
+                d.n++;
+                daySums.set(k, d);
+            });
+            const valMap = new Map([...daySums].map(([k, d]) => [k, d.sum / d.n]));
 
             const dense = [];
             let current = new Date(start);
@@ -1362,14 +1506,13 @@
 
             try {
                 const resourceId = await getResourceId();
-                const sql = `SELECT DISTINCT "label_name" FROM "${resourceId}" ORDER BY "label_name"`;
+                const col = CONFIG.columns.location;
+                const sql = `SELECT DISTINCT "${col}" FROM "${resourceId}" ORDER BY "${col}"`;
                 const url = `${CONFIG.apiBase}/datastore_search_sql?sql=${encodeURIComponent(sql)}`;
 
-                const resp = await fetch(url);
-                const json = await resp.json();
-
-                if (json.success && json.result.records) {
-                    allAvailableLabels = json.result.records.map(r => r.label_name).filter(l => l);
+                const result = await ckanGet(url);
+                if (result.records) {
+                    allAvailableLabels = result.records.map(r => r[col]).filter(l => l);
                     localStorage.setItem(cacheKey, JSON.stringify({
                         timestamp: Date.now(),
                         labels: allAvailableLabels
@@ -1497,10 +1640,8 @@
                 const query = searchInput ? searchInput.value : '';
                 if (!query) return;
 
-                // 2. Normalize Key (Match logic in fetchData)
-                const normalizedQuery = query.split('(')[0].trim();
-                const cacheKey = `ww_data_${normalizedQuery}`;
-                const cachedRaw = localStorage.getItem(cacheKey);
+                // 2. Read the same cache entry fetchData uses
+                const cachedRaw = localStorage.getItem(cacheKeyFor(query));
 
                 let dataAgeMs = 0;
                 let dataTimestamp = 0;
