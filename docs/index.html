@@ -506,11 +506,22 @@
                     <div style="margin-top: 10px; line-height: 1.6;">
                         <ol style="padding-left: 20px; margin: 0;">
                             <li style="margin-bottom: 8px;"><strong>Raw Concentration:</strong> We use the raw viral
-                                concentration (copies/L).
+                                concentration (copies/L of wastewater or copies/g of sludge, depending on the lab).
                                 Ideally, we would normalize by PMMoV (a harmless fecal plant virus) to account for
                                 dilution, but PMMoV data is unavailable in this specific dataset.</li>
+                            <li style="margin-bottom: 8px;"><strong>One Series per Line:</strong> Some plants are tested
+                                by more than one lab (in units that can't be compared), at more than one site, or with
+                                more than one assay. Each line uses a single series: one that is still reporting,
+                                preferring samples taken at the plant over upstream sites, and among those the one
+                                sampled on the most days over the last 18 months (near-equal counts go to the longer
+                                history). A "Recent Trend" card needs at least 8 weeks of that series' history.</li>
+                            <li style="margin-bottom: 8px;"><strong>Non-Detects Count:</strong> Samples where the virus
+                                wasn't found count as 0, so a rare detection shows as a brief bump, not a trend.
+                                Viruses with no detections in the selected range aren't drawn.</li>
                             <li style="margin-bottom: 8px;"><strong>Robust Smoothing:</strong> We use a two-step filter
                                 (Median then Rolling Average) to remove single-day outliers and show the true trend.
+                                The median compares detections only with other detections, so a lone detection
+                                among non-detects is kept (it can't be told apart from a one-off error).
                             </li>
                             <li style="margin-bottom: 8px;"><strong>% of Peak:</strong> levels are shown as a percentage
                                 of the highest smoothed value observed in the last 18 months.</li>
@@ -576,6 +587,9 @@
 
     <script>
         // --- 1. Config ---
+        // Every city cache key starts with this, in any format version.
+        const CACHE_ROOT = 'ww_data_';
+
         const CONFIG = {
             // The dataset is published on the CalHHS open data portal. data.ca.gov
             // still lists it, but its datastore copy was removed (Nov 2026), so
@@ -583,145 +597,378 @@
             apiBase: 'https://data.chhs.ca.gov/api/3/action',
             packageId: 'wastewater-surveillance-data-california',
             fallbackResourceId: '2742b824-3736-4292-90a9-7fad98e94c06',
-            limit: 50000
+            // Only the columns the dashboard uses. Full rows have ~100 columns
+            // and are ~20x larger to download and parse. lab + units + site +
+            // sample location + assay identify which measurement series a row
+            // belongs to. These are requested by name, so if the portal renames
+            // one, every search fails with its validation error naming the
+            // column: update the name here.
+            columns: {
+                date: 'sample_collect_date',
+                virus: 'pcr_target',
+                value: 'pcr_target_avg_conc',
+                location: 'label_name',
+                lab: 'lab_id',
+                units: 'pcr_target_units',
+                site: 'site_id',
+                siteType: 'sample_location', // 'wwtp' (plant influent) or 'upstream'
+                assay: 'pcr_gene_target'
+            },
+            // Rows per request. The portal caps responses at 50,000 rows, so
+            // larger cities (e.g. Santa Clara) are fetched in several pages.
+            limit: 50000,
+            // Refuse searches that match close to the whole dataset (~430k rows,
+            // e.g. "CA"). The largest city is ~65k rows and grows ~14k a year.
+            maxRows: 250000,
+            // "% of peak" baseline and series-selection window.
+            baselineMonths: 18,
+            // A series is "still reporting" with data this recent relative to
+            // the newest sample; stats cards use the same staleness rule.
+            currentDays: 14,
+            // A "Recent trend" card needs a series with at least this much
+            // history: "% of peak" means little against a few weeks (e.g. just
+            // after a lab changed assays, which starts a new series).
+            minHistoryDays: 56,
+            // How long fetched data is used before it's fetched again.
+            cacheTtlMs: 24 * 60 * 60 * 1000,
+            // Don't cache entries bigger than this: they can't fit in Safari's
+            // ~2.5M-character localStorage, and trying would first clear the
+            // city already cached. (A city is up to ~1.5M characters.)
+            maxCacheChars: 2400000,
+            // Bump when the shape or meaning of cached data changes.
+            cachePrefix: CACHE_ROOT + 'v4_'
         };
+
+        const DAY_MS = 24 * 60 * 60 * 1000;
+
+        // A search is made by its core location name, the part before any
+        // parenthesis: "San Francisco (Oceanside)" -> "San Francisco". That
+        // fetches every facility in the city, and keys the cache.
+        function coreName(query) {
+            return query.split('(')[0].trim();
+        }
+
+        function cacheKeyFor(query) {
+            return CONFIG.cachePrefix + coreName(query).toLowerCase();
+        }
+
+        // Remove cached city data, except the entries `keep` returns true for.
+        function clearCityCaches(keep) {
+            Object.keys(localStorage)
+                .filter(k => k.startsWith(CACHE_ROOT) && !keep(k))
+                .forEach(k => localStorage.removeItem(k));
+        }
+
+        // Cached rows are stored compactly ([minutes, virus#, location#, value]
+        // plus name lists): as plain objects a large city (~65k rows) is bigger
+        // than localStorage's ~5 MB limit.
+        function packRows(rows) {
+            const names = { virus: [], location: [] };
+            const index = { virus: new Map(), location: new Map() };
+            const id = (field, value) => {
+                if (!index[field].has(value)) {
+                    index[field].set(value, names[field].length);
+                    names[field].push(value);
+                }
+                return index[field].get(value);
+            };
+            return {
+                ...names,
+                rows: rows.map(d => [d.date.getTime() / 60000, id('virus', d.virus), id('location', d.location), d.val])
+            };
+        }
+
+        function unpackRows(packed) {
+            return packed.rows.map(([minutes, v, l, val]) => ({
+                date: new Date(minutes * 60000),
+                virus: packed.virus[v],
+                location: packed.location[l],
+                val
+            }));
+        }
 
         // --- 2. State ---
         let fullDataset = [];
         let allAvailableLabels = []; // For autocomplete
         let chart = null;
         let currentMonths = 3;
-        let currentQuery = '';
+        let currentLocation = null; // facility on screen
+        let dataTimestamp = 0;      // when the data on screen was fetched
+        let retryQuery = null;      // search that failed with nothing on screen; auto-refresh retries it
 
         const logEl = document.getElementById('debug');
         function log(msg) {
-            logEl.innerHTML += `> ${msg}<br>`;
+            logEl.append(`> ${msg}`, document.createElement('br'));
             if (document.getElementById('debugToggle') && document.getElementById('debugToggle').checked) {
                 logEl.style.display = 'block';
             }
         }
 
         // --- 3. Dynamic Resource Logic ---
-        async function getResourceId() {
-            try {
-                const url = `${CONFIG.apiBase}/package_show?id=${CONFIG.packageId}`;
-                const resp = await fetch(url);
-                const json = await resp.json();
-                if (json.success && json.result?.resources) {
+        // Looked up once and shared by every caller. If the lookup fails (or
+        // takes over 10 s), the fallback ID is used and the lookup is tried
+        // again after 5 minutes. A search that gets "resource not found" clears
+        // it at once (forgetResourceId), in case the portal replaced it.
+        let resourceIdPromise = null;
+        function getResourceId() {
+            resourceIdPromise = resourceIdPromise || (async () => {
+                try {
+                    const result = await ckanGetWithin(`${CONFIG.apiBase}/package_show?id=${CONFIG.packageId}`, 10000);
                     // Skip resources without a live datastore: that is how the
                     // data.ca.gov copy broke (still listed, datastore removed).
-                    const res = json.result.resources.find(r => r.format === 'CSV' && r.name.includes('Wastewater Surveillance') && r.datastore_active);
-                    if (res) return res.id;
+                    const res = (result?.resources || []).find(r => r && r.format === 'CSV' && String(r.name || '').includes('Wastewater Surveillance') && r.datastore_active);
+                    return res ? res.id : CONFIG.fallbackResourceId;
+                } catch (e) {
+                    console.warn(e);
+                    setTimeout(forgetResourceId, 5 * 60 * 1000);
+                    return CONFIG.fallbackResourceId;
                 }
-            } catch (e) { console.warn(e); }
-            return CONFIG.fallbackResourceId;
+            })();
+            return resourceIdPromise;
+        }
+
+        function forgetResourceId() {
+            resourceIdPromise = null;
+        }
+
+        // ckanGet with a time limit. `signal` (a newer search) also cancels it;
+        // running out of time is reported as a network error, so a failed
+        // load can be retried.
+        async function ckanGetWithin(url, ms, signal) {
+            const ctrl = new AbortController();
+            const cancel = () => ctrl.abort();
+            if (signal?.aborted) cancel(); else signal?.addEventListener('abort', cancel);
+            const timer = setTimeout(cancel, ms);
+            try {
+                return await ckanGet(url, ctrl.signal);
+            } catch (e) {
+                if (e.name === 'AbortError' && !signal?.aborted) {
+                    throw new Error(`Network error: the data portal didn't respond within ${ms / 1000} seconds.`);
+                }
+                throw e;
+            } finally {
+                clearTimeout(timer);
+                signal?.removeEventListener('abort', cancel);
+            }
         }
 
         // GET a CKAN action URL and return its `result`, or throw an Error that
         // carries the portal's own reason (CKAN validation errors have no
         // `message`, and proxies/CDNs can answer with non-JSON pages).
-        async function ckanGet(url) {
-            const resp = await fetch(url);
+        async function ckanGet(url, signal) {
+            let resp;
+            try {
+                resp = await fetch(url, { signal });
+            } catch (e) {
+                if (e.name === 'AbortError') throw e;
+                throw new Error(`Network error: couldn't reach the data portal (${e.message}).`);
+            }
             let json;
             try {
                 json = await resp.json();
             } catch (e) {
-                throw new Error(`API Error: HTTP ${resp.status} ${resp.statusText}`.trim());
+                if (e.name === 'AbortError') throw e;
+                // A JSON response whose body can't be parsed was cut off
+                // mid-download; anything else is a page that isn't the API's
+                // (an error page, or a proxy/captive-portal page).
+                if (resp.ok && /json/i.test(resp.headers.get('content-type') || '')) {
+                    throw new Error(`Network error: the response was cut off (${e.message}).`);
+                }
+                const status = [resp.status, resp.statusText].filter(Boolean).join(' ');
+                throw new Error(`API Error: unexpected non-JSON response (HTTP ${status})`);
             }
             if (!json.success) {
                 const err = json.error || {};
                 const detail = err.message || (Object.keys(err).length ? JSON.stringify(err) : `HTTP ${resp.status}`);
-                throw new Error(`API Error: ${detail}`);
+                throw Object.assign(new Error(`API Error: ${detail}`), { type: err.__type });
             }
             return json.result;
         }
 
+        // Fetch every row matching a search (full-text, as before), one page
+        // at a time: the portal caps each response at CONFIG.limit rows.
+        // Sorting by _id keeps pages from overlapping or skipping rows; if the
+        // total changes between pages the portal reloaded the table, so start
+        // over rather than mix two snapshots. Rows come back as arrays
+        // (records_format=lists, about half the JSON of objects) and are turned
+        // into objects keyed by column name. `signal` cancels the requests.
+        // Pages are fetched one after another on purpose: real cities need at
+        // most two, and sequential requests keep cancellation simple. The
+        // too-broad check uses the first page's total: asking for the count
+        // alone costs the portal about as much as the first page.
+        async function fetchAllRecords(resourceId, query, onProgress, signal) {
+            for (let attempt = 0; attempt < 2; attempt++) {
+                const records = [];
+                let total = null;
+                let changed = false;
+                while (total === null || records.length < total) {
+                    const params = new URLSearchParams({
+                        resource_id: resourceId,
+                        q: query,
+                        fields: Object.values(CONFIG.columns).join(','),
+                        sort: '_id',
+                        records_format: 'lists',
+                        limit: CONFIG.limit,
+                        offset: records.length
+                    });
+                    const result = await ckanGetWithin(`${CONFIG.apiBase}/datastore_search?${params}`, 60000, signal);
+                    if (total === null) {
+                        total = result.total;
+                        if (total > CONFIG.maxRows) {
+                            throw queryError(`"${query}" matches ${total.toLocaleString()} records. Please pick a specific facility from the list.`);
+                        }
+                    } else if (result.total !== total) {
+                        changed = true;
+                        break;
+                    }
+                    const names = result.fields.map(f => f.id);
+                    for (const row of result.records) {
+                        const r = {};
+                        names.forEach((name, i) => { r[name] = row[i]; });
+                        records.push(r);
+                    }
+                    if (result.records.length === 0 && records.length < total) {
+                        changed = true; // rows missing: treat like a reload and start over
+                        break;
+                    }
+                    if (records.length < total) onProgress?.(records.length, total);
+                }
+                if (!changed) return records;
+                log('Dataset changed while loading; starting over.');
+            }
+            throw new Error('API Error: the dataset was being updated. Please try again in a minute.');
+        }
+
         // --- 4. Main Data Fetch (With Caching) ---
-        async function fetchData(query) {
+        // Each fetchData call takes a number; only the latest call may render,
+        // so a slow earlier search can't overwrite a newer one. Starting a new
+        // search also aborts the previous one's downloads.
+        let fetchSeq = 0;
+        let fetchAbort = null;
+
+        // skipCache: fetch fresh data even if the cache is fresh ("Check for
+        // Updates"); the cache entry is only replaced if that succeeds.
+        async function fetchData(query, { skipCache = false } = {}) {
+            const seq = ++fetchSeq;
+            retryQuery = null;
+            fetchAbort?.abort();
+            const abort = fetchAbort = new AbortController();
             document.getElementById('loading').style.display = 'flex';
             document.getElementById('error').style.display = 'none';
             document.getElementById('loading-text').innerText = `Searching for "${query}"...`;
 
             try {
-                // Normalize cache key: extract core location name (before first parenthesis)
-                // "San Francisco (Oceanside)" -> "San Francisco"
-                const normalizedQuery = query.split('(')[0].trim();
-                const cacheKey = `ww_data_${normalizedQuery}`;
-                const cached = localStorage.getItem(cacheKey);
-                const selectedFacility = localStorage.getItem('lastLocation');
+                const normalizedQuery = coreName(query);
+                if (!normalizedQuery) throw queryError('Enter a city or facility name.');
+                const cacheKey = cacheKeyFor(query);
+                const cached = skipCache ? null : localStorage.getItem(cacheKey);
 
-                // Check Cache (Expires after 24 hours)
+                // A fresh cache entry holds exactly what a fetch would return
+                // (both are keyed by the city name), so use it. Reading it is
+                // kept apart from rendering, so a rendering error isn't
+                // mistaken for a bad cache entry.
+                let cachedRows = null, cachedAt = 0;
                 if (cached) {
                     try {
                         const parsed = JSON.parse(cached);
-                        const age = Date.now() - parsed.timestamp;
-                        if (age < 1000 * 60 * 60 * 24) { // 24 hours
-                            // Rehydrate Dates
-                            const rehydrated = parsed.data.map(d => ({ ...d, date: new Date(d.date) }));
-
-                            // Check if selected facility exists in cached data
-                            const uniqueLocations = [...new Set(rehydrated.map(d => d.location))];
-                            if (selectedFacility && uniqueLocations.includes(selectedFacility)) {
-                                log(`Using cached data (${(age / 3600000).toFixed(1)}h old)`);
-                                const dateStr = new Date(parsed.timestamp).toLocaleString([], { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-                                document.getElementById('cache-status').innerText = `Loaded from cache (${dateStr})`;
-                                document.getElementById('cache-status').style.color = '#059669'; // Green-ish
-
-                                initWithData(rehydrated);
-                                return;
-                            }
-                            // Selected facility not in cache, need to fetch
-                            log(`Selected facility "${selectedFacility}" not in cache, fetching...`);
+                        if (Date.now() - parsed.timestamp < CONFIG.cacheTtlMs) {
+                            cachedRows = unpackRows(parsed.data);
+                            cachedAt = parsed.timestamp;
                         }
-                    } catch (e) { console.warn("Cache parse failed", e); }
+                    } catch (e) { console.warn("Cache unreadable", e); }
+                }
+                if (cachedRows) {
+                    log(`Using cached data (${((Date.now() - cachedAt) / 3600000).toFixed(1)}h old)`);
+                    const dateStr = new Date(cachedAt).toLocaleString([], { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+                    document.getElementById('cache-status').innerText = `Loaded from cache (${dateStr})`;
+                    document.getElementById('cache-status').style.color = '#059669'; // Green-ish
+                    showData(cachedRows, query, cachedAt);
+                    return;
                 }
 
-                // Fetch New - use NORMALIZED query to get all facilities for the city
+                // Fetch every facility in the city (by its core name)
                 const resourceId = await getResourceId();
-                const url = `${CONFIG.apiBase}/datastore_search?resource_id=${resourceId}&q=${encodeURIComponent(normalizedQuery)}&limit=${CONFIG.limit}`;
-
-                const result = await ckanGet(url);
-                const raw = result.records;
+                const raw = await fetchAllRecords(resourceId, normalizedQuery, (done, total) => {
+                    if (seq !== fetchSeq) return;
+                    document.getElementById('loading-text').innerText = `Loading ${done.toLocaleString()} of ${total.toLocaleString()} records...`;
+                    log(`Fetched ${done} of ${total} records...`);
+                }, abort.signal);
+                if (seq !== fetchSeq) return; // a newer search started meanwhile
                 log(`Found ${raw.length} records.`);
-                if (raw.length === 0) throw new Error("No records found for this city.");
-
-                const nowStr = new Date().toLocaleString();
-                document.getElementById('cache-status').innerText = `Live data fetched (${nowStr})`;
-                document.getElementById('cache-status').style.color = '#2563eb'; // Blue
+                if (raw.length === 0) throw queryError("No records found for this city.");
 
                 const cleanData = parseRawData(raw);
+                if (cleanData.length === 0) throw queryError("No usable records found for this city.");
+                const fetchedAt = Date.now();
 
-                // Save to Cache (Minimal Data)
-                try {
-                    localStorage.setItem(cacheKey, JSON.stringify({
-                        timestamp: Date.now(),
-                        data: cleanData
-                    }));
-                } catch (e) {
-                    console.warn("Cache full", e);
-                    log("Warning: Cache full, performance may degrade on reload.");
+                document.getElementById('cache-status').innerText = `Live data fetched (${new Date(fetchedAt).toLocaleString()})`;
+                document.getElementById('cache-status').style.color = '#2563eb'; // Blue
+
+                // Cache it (a city is up to ~1.2M characters packed;
+                // localStorage holds ~2.5M in Safari, ~5M elsewhere). If storage
+                // is full, clear the other cities and try once more (an entry
+                // within maxCacheChars then fits). If this city can't be
+                // cached, remove its older entry so a later load doesn't bring
+                // back data older than what was just shown.
+                const entry = JSON.stringify({ timestamp: fetchedAt, data: packRows(cleanData) });
+                const dropOldEntry = () => { try { localStorage.removeItem(cacheKey); } catch (e) { /* ignore */ } };
+                if (entry.length > CONFIG.maxCacheChars) {
+                    log('Too much data to cache; it will be fetched again next time.');
+                    dropOldEntry();
+                } else {
+                    try {
+                        localStorage.setItem(cacheKey, entry);
+                    } catch (e) {
+                        try {
+                            clearCityCaches(k => k === cacheKey);
+                            localStorage.setItem(cacheKey, entry);
+                            log('Storage full: cleared other cities to make room.');
+                        } catch (e2) {
+                            console.warn('Not cached', e2);
+                            log('Not cached (storage full); it will be fetched again next time.');
+                            dropOldEntry();
+                        }
+                    }
                 }
 
-                initWithData(cleanData);
+                showData(cleanData, query, fetchedAt);
 
             } catch (err) {
+                if (seq !== fetchSeq) return; // superseded (or aborted) by a newer search
                 document.getElementById('error').style.display = 'flex';
                 document.getElementById('error').innerText = err.message;
+                // The portal may have replaced the resource: look it up again.
+                if (err.type === 'Not Found Error') forgetResourceId();
+                // With nothing on screen, let auto-refresh retry this search.
+                // Not for a bad search: retrying that can't help.
+                if (!fullDataset.length && !err.queryError) retryQuery = query;
             } finally {
-                document.getElementById('loading').style.display = 'none';
+                if (seq === fetchSeq) document.getElementById('loading').style.display = 'none';
             }
+        }
+
+        // An error caused by the search itself (not the network or portal).
+        function queryError(message) {
+            return Object.assign(new Error(message), { queryError: true });
+        }
+
+        // A search loaded successfully: show it, note when its data was
+        // fetched (for auto-refresh), and remember it (only now, so a search
+        // that fails is never saved; best-effort, storage may be full).
+        function showData(data, query, fetchedAt) {
+            dataTimestamp = fetchedAt;
+            initWithData(data, query);
+            try {
+                localStorage.setItem('lastSearch', query);
+            } catch (e) { console.warn('Could not save the search', e); }
         }
 
         function forceRefresh() {
             const query = document.getElementById('citySearch').value;
             if (!query) return;
 
-            // Clear cache for this query (use normalized key)
-            const normalizedQuery = query.split('(')[0].trim();
-            localStorage.removeItem(`ww_data_${normalizedQuery}`);
-            log('Manual refresh: Cache cleared.');
-
-            fetchData(query);
+            log('Manual refresh: fetching fresh data.');
+            fetchData(query, { skipCache: true });
         }
 
         function toggleDebug(show) {
@@ -736,11 +983,7 @@
 
         function toggleSmoothing(checked) {
             localStorage.setItem('enableSmoothing', checked);
-            const saved = localStorage.getItem('lastLocation');
-            // If we have data and a location, re-render
-            if (fullDataset.length > 0 && saved) {
-                renderChart(saved);
-            }
+            if (currentLocation) renderChart(currentLocation);
         }
 
         function toggleDarkMode() {
@@ -750,74 +993,112 @@
             localStorage.setItem('darkMode', isDark);
 
             // Re-render chart to update grid colors if needed
-            if (fullDataset.length > 0) {
-                const uniqueLocations = [...new Set(fullDataset.map(d => d.location))].sort();
-                const saved = localStorage.getItem('lastLocation');
-                const loc = (saved && uniqueLocations.includes(saved)) ? saved : uniqueLocations[0];
-                if (loc) renderChart(loc);
-            }
+            if (currentLocation) renderChart(currentLocation);
         }
 
-        function initWithData(data) {
+        function initWithData(data, query) {
             fullDataset = data;
-            // Auto-render the selected location or first available
+            // Render the searched facility (case-insensitive): an exact match,
+            // else the first starting with the search ("Santa Clara"), else the
+            // first containing it ("San Jose"), else the first facility.
             const uniqueLocations = [...new Set(fullDataset.map(d => d.location))].sort();
             if (uniqueLocations.length > 0) {
-                const saved = localStorage.getItem('lastLocation');
-                // Check if saved location matches exactly, or find one that contains the search term
-                let loc = null;
-                if (saved && uniqueLocations.includes(saved)) {
-                    loc = saved;
-                } else if (saved) {
-                    // Try to find a facility that starts with the saved query
-                    loc = uniqueLocations.find(l => l.toLowerCase().startsWith(saved.toLowerCase()));
-                }
-                if (!loc) loc = uniqueLocations[0];
+                const q = query.trim().toLowerCase();
+                const loc = uniqueLocations.find(l => l.toLowerCase() === q)
+                    || uniqueLocations.find(l => l.toLowerCase().startsWith(q))
+                    || uniqueLocations.find(l => l.toLowerCase().includes(q))
+                    || uniqueLocations[0];
 
-                localStorage.setItem('lastLocation', loc);
+                currentLocation = loc;
                 renderChart(loc);
             }
         }
 
-        function parseRawData(raw) {
-            // Standardize Columns
-            const keys = Object.keys(raw[0]);
-            const cols = {
-                date: keys.find(k => k.match(/sample_collect_date|date/i)),
-                virus: keys.find(k => k.match(/pcr_target|pathogen|virus/i) && !k.match(/unit|gene/i)),
-                value: keys.find(k => (k.match(/pcr_target_avg_conc|concentration|copies/i) && !k.match(/method/i))),
-                location: keys.find(k => k.match(/label_name/i)) || keys.find(k => k.match(/facility_name/i)) || keys.find(k => k.match(/wwtp_name/i))
-            };
+        // 4 significant digits: well below qPCR measurement error, and keeps a
+        // large city's cache entry ~20% smaller.
+        const round4 = v => (v === 0 || !isFinite(v)) ? v : Number(v.toPrecision(4));
 
-            return raw.map(r => ({
-                date: new Date(r[cols.date]),
-                virus: r[cols.virus],
-                val: parseFloat(r[cols.value]),
-                location: r[cols.location]
-            })).filter(d => !isNaN(d.val) && d.val > 0 && d.location);
+        // Turn API rows into chart rows. Non-detects (0) are kept as real zeros,
+        // so rare detections don't get stretched into a steady trend.
+        function parseRawData(raw) {
+            const cols = CONFIG.columns;
+            const rows = raw.map(r => {
+                const siteType = String(r[cols.siteType] || '').toLowerCase();
+                return {
+                    date: new Date(r[cols.date]),
+                    virus: r[cols.virus],
+                    val: round4(parseFloat(r[cols.value])),
+                    location: r[cols.location],
+                    series: `${r[cols.lab]}|${String(r[cols.units] || '').toLowerCase()}|${r[cols.site]}|${siteType}|${r[cols.assay]}`,
+                    // Prefer the plant's own influent over upstream manholes.
+                    siteRank: siteType === 'wwtp' ? 2 : siteType === 'upstream' ? 0 : 1
+                };
+            }).filter(d => !isNaN(d.val) && d.val >= 0 && d.location && !isNaN(d.date.getTime()));
+            return keepOneSeries(rows).map(({ series, siteRank, ...d }) => d);
         }
+
+        // A plant can have several measurement series for one virus: different
+        // labs with units that can't be compared (e.g. copies/g dry sludge vs
+        // copies/L wastewater), different sampling sites (plant influent vs
+        // upstream manholes) and different assays (e.g. infa1 vs infa1+infa2
+        // combined, whose values differ). Averaging or alternating them is
+        // meaningless, so for each plant and virus keep one lab + unit + site
+        // + sample location + assay series, chosen by narrowing the candidates
+        // step by step:
+        //   1. still reporting (data within CONFIG.currentDays of the newest sample);
+        //   2. plant influent over unlabelled over upstream samples (the
+        //      sample location is part of the series: some labs report
+        //      upstream samples under the plant's site id);
+        //   3. within 10% of the most sample days in the last 18 months (days,
+        //      not rows: some labs send several rows per sample), so near-equal
+        //      labs don't swap from one day to the next as the window moves;
+        //   4. then the most all-time sample days, most recent days, latest data.
+        function keepOneSeries(rows) {
+            const since = new Date();
+            since.setMonth(since.getMonth() - CONFIG.baselineMonths);
+
+            const stats = new Map(); // "location|virus" -> Map(series -> stats)
+            for (const r of rows) {
+                const key = `${r.location}|${r.virus}`;
+                if (!stats.has(key)) stats.set(key, new Map());
+                const bySeries = stats.get(key);
+                const s = bySeries.get(r.series) || { siteRank: 0, days: new Set(), allDays: new Set(), last: 0 };
+                const t = r.date.getTime();
+                s.siteRank = Math.max(s.siteRank, r.siteRank);
+                s.allDays.add(t);
+                if (r.date >= since) s.days.add(t);
+                s.last = Math.max(s.last, t);
+                bySeries.set(r.series, s);
+            }
+
+            const chosen = new Map();
+            for (const [key, bySeries] of stats) {
+                let candidates = [...bySeries].map(([series, s]) => ({ series, ...s }));
+                const newest = Math.max(...candidates.map(c => c.last));
+                candidates = candidates.filter(c => c.last >= newest - CONFIG.currentDays * DAY_MS);
+                const bestRank = Math.max(...candidates.map(c => c.siteRank));
+                candidates = candidates.filter(c => c.siteRank === bestRank);
+                const mostDays = Math.max(...candidates.map(c => c.days.size));
+                candidates = candidates.filter(c => c.days.size >= 0.9 * mostDays);
+                candidates.sort((a, b) => (b.allDays.size - a.allDays.size) || (b.days.size - a.days.size) || (b.last - a.last));
+                chosen.set(key, candidates[0].series);
+            }
+            return rows.filter(r => chosen.get(`${r.location}|${r.virus}`) === r.series);
+        }
+
 
         // --- 5. UI Logic ---
 
         function runNewSearch(val) {
             if (!val) return;
-            currentQuery = val;
-            localStorage.setItem('lastSearch', val);
-            // Save the selected facility so initWithData can use it
-            localStorage.setItem('lastLocation', val);
-            fetchData(val);
+            fetchData(val); // saved as lastSearch once it loads
         }
 
         function updateTimeRange(m) {
             currentMonths = m;
             localStorage.setItem('lastMonths', m);
             // Re-render with current data if available
-            if (fullDataset.length > 0) {
-                const uniqueLocations = [...new Set(fullDataset.map(d => d.location))].sort();
-                const saved = localStorage.getItem('lastLocation');
-                const loc = (saved && uniqueLocations.includes(saved)) ? saved : uniqueLocations[0];
-                if (loc) renderChart(loc);
-            }
+            if (currentLocation) renderChart(currentLocation);
         }
 
         // --- 6. Stats & Labels ---
@@ -894,7 +1175,7 @@
             return raw.charAt(0).toUpperCase() + raw.slice(1);
         }
 
-        function updateStatsUI(smoothedMap, peakMap) {
+        function updateStatsUI(smoothedMap, peakMap, shortHistory = false) {
             const statsRow = document.getElementById('stats-grid');
             statsRow.innerHTML = '';
 
@@ -912,12 +1193,12 @@
 
                 // Check if data is "recent" (within last 14 days to be safe, though fallback handles gaps)
                 const now = new Date();
-                const diffDays = (now - latestPoint.date) / (1000 * 3600 * 24);
+                const diffDays = (now - latestPoint.date) / DAY_MS;
 
                 // If data is older than 14 days, don't show as a "Recent Spike"
-                if (diffDays > 14) continue;
+                if (diffDays > CONFIG.currentDays) continue;
 
-                if (peakVal > 0) {
+                if (peakVal > 0 && latestPoint.val > 0) {
                     spikes.push({
                         virus: virus,
                         label: formatLabel(virus),
@@ -931,7 +1212,8 @@
             const top3 = spikes.slice(0, 3);
 
             if (top3.length === 0) {
-                statsRow.innerHTML = '<div style="color:var(--muted); grid-column:1/-1;">No recent activity detected.</div>';
+                const msg = shortHistory ? 'Not enough history yet for recent trends.' : 'No recent activity detected.';
+                statsRow.innerHTML = `<div style="color:var(--muted); grid-column:1/-1;">${msg}</div>`;
                 return;
             }
 
@@ -1034,8 +1316,17 @@
                 return `${year}-${month}-${day}`;
             };
 
-            const valMap = new Map();
-            rows.forEach(r => valMap.set(toKey(r.date), r.val));
+            // Average same-day samples (one lab can report several per day), so
+            // the value doesn't depend on which row happened to come last.
+            const daySums = new Map();
+            rows.forEach(r => {
+                const k = toKey(r.date);
+                const d = daySums.get(k) || { sum: 0, n: 0 };
+                d.sum += r.val;
+                d.n++;
+                daySums.set(k, d);
+            });
+            const valMap = new Map([...daySums].map(([k, d]) => [k, d.sum / d.n]));
 
             const dense = [];
             let current = new Date(start);
@@ -1049,6 +1340,16 @@
 
             // 3. Pass 1: Rolling Median (Window 5)
             // Trailing Window: -4 to 0 (Current day is 0, look back 4 days)
+            // The median removes one-off spikes among detections. Non-detects
+            // (0) neither count toward it nor get replaced by it: a detection
+            // is compared only with other detections (so a rare one among
+            // zeros survives), and a non-detect day stays 0. Days without a
+            // sample are filled from all values in the window, as before.
+            const median = arr => {
+                const a = [...arr].sort((x, y) => x - y);
+                const mid = Math.floor(a.length / 2);
+                return a.length % 2 !== 0 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+            };
             const medianSeries = dense.map((v, i) => {
                 const window = [];
                 for (let j = -4; j <= 0; j++) {
@@ -1056,10 +1357,9 @@
                     if (val !== undefined && val !== null) window.push(val);
                 }
                 if (window.length === 0) return null;
-                window.sort((a, b) => a - b);
-                const mid = Math.floor(window.length / 2);
-                if (window.length % 2 !== 0) return window[mid];
-                return (window[mid - 1] + window[mid]) / 2;
+                if (v === 0) return 0;
+                if (v > 0) return median(window.filter(x => x > 0));
+                return median(window);
             });
 
             // If Rolling Avg is disabled, return Median series directly
@@ -1135,7 +1435,7 @@
             const datasets = [];
 
             // Adaptive Baseline
-            const baselineMonths = Math.max(currentMonths, 18);
+            const baselineMonths = Math.max(currentMonths, CONFIG.baselineMonths);
             const baselineDate = new Date();
             baselineDate.setMonth(baselineDate.getMonth() - baselineMonths);
 
@@ -1161,6 +1461,8 @@
             }).sort((a, b) => b.intensity - a.intensity);
 
             const allSmoothedMap = {};
+            let anySamplesInRange = false;
+            let shortHistory = false; // a drawn virus had too little history for a card
             const allPeakMap = {};
 
             for (const { virus, rows, maxPeak } of sortedEntries) {
@@ -1175,10 +1477,6 @@
                 // Fallback
                 if (smoothPeak === 0) smoothPeak = maxPeak;
 
-                // Collect for Stats UI
-                allSmoothedMap[virus] = smoothed;
-                allPeakMap[virus] = smoothPeak;
-
                 const points = smoothed
                     .filter(p => p.date >= cutoff)
                     .map(p => ({
@@ -1187,7 +1485,21 @@
                         raw: p.val, // This is the smoothed ratio
                     }));
 
-                if (points.length > 0) {
+                if (points.length) anySamplesInRange = true;
+
+                // Hide viruses with no detections in the shown range (all-zero
+                // lines carry no information and crowd the legend).
+                if (points.some(p => p.y > 0)) {
+                    // Stats cards cover the drawn viruses whose series has
+                    // enough history for "% of peak" to mean something.
+                    const historyDays = (rows[rows.length - 1].date - rows[0].date) / DAY_MS;
+                    if (historyDays >= CONFIG.minHistoryDays) {
+                        allSmoothedMap[virus] = smoothed;
+                        allPeakMap[virus] = smoothPeak;
+                    } else {
+                        shortHistory = true;
+                    }
+
                     const color = getVirusColor(virus);
                     datasets.push({
                         label: formatLabel(virus),
@@ -1203,7 +1515,7 @@
             }
 
             // Update Stats UI with the EXACT smoothed data
-            updateStatsUI(allSmoothedMap, allPeakMap);
+            updateStatsUI(allSmoothedMap, allPeakMap, shortHistory);
 
             const ctx = document.getElementById('canvas').getContext('2d');
             if (chart) chart.destroy();
@@ -1221,6 +1533,11 @@
                     maintainAspectRatio: false,
                     interaction: { mode: 'nearest', intersect: false },
                     plugins: {
+                        title: {
+                            display: datasets.length === 0,
+                            text: anySamplesInRange ? 'No detections in the selected period' : 'No samples in the selected period',
+                            color: textColor
+                        },
                         tooltip: {
                             mode: 'nearest',
                             intersect: false,
@@ -1333,10 +1650,7 @@
         }
 
         document.getElementById('citySearch').value = savedSearch;
-        // Ensure lastLocation is set from savedSearch on first load
-        if (!localStorage.getItem('lastLocation')) {
-            localStorage.setItem('lastLocation', savedSearch);
-        }
+        localStorage.removeItem('lastLocation'); // no longer used
         fetchData(savedSearch);
 
         // --- 8. Autocomplete Logic ---
@@ -1348,25 +1662,23 @@
             const cacheKey = 'ww_available_labels';
             const cached = localStorage.getItem(cacheKey);
 
-            if (cached) {
-                const parsed = JSON.parse(cached);
-                const age = Date.now() - parsed.timestamp;
-                if (age < 1000 * 60 * 60 * 24 * 7) { // 1 week cache
+            try {
+                const parsed = cached && JSON.parse(cached);
+                if (parsed && Array.isArray(parsed.labels) && Date.now() - parsed.timestamp < 7 * DAY_MS) { // 1 week cache
                     allAvailableLabels = parsed.labels;
                     return;
                 }
-            }
+            } catch (e) { console.warn('Labels cache unreadable', e); }
 
             try {
                 const resourceId = await getResourceId();
-                const sql = `SELECT DISTINCT "label_name" FROM "${resourceId}" ORDER BY "label_name"`;
+                const col = CONFIG.columns.location;
+                const sql = `SELECT DISTINCT "${col}" FROM "${resourceId}" ORDER BY "${col}"`;
                 const url = `${CONFIG.apiBase}/datastore_search_sql?sql=${encodeURIComponent(sql)}`;
 
-                const resp = await fetch(url);
-                const json = await resp.json();
-
-                if (json.success && json.result.records) {
-                    allAvailableLabels = json.result.records.map(r => r.label_name).filter(l => l);
+                const result = await ckanGet(url);
+                if (result.records) {
+                    allAvailableLabels = result.records.map(r => r[col]).filter(l => l);
                     localStorage.setItem(cacheKey, JSON.stringify({
                         timestamp: Date.now(),
                         labels: allAvailableLabels
@@ -1485,33 +1797,24 @@
 
         // --- 9. Robust Auto-Refresh Logic (Data Age Based) ---
         function initAutoRefresh() {
-            const RELOAD_THRESHOLD_MS = 24 * 60 * 60 * 1000; // 24 hours
+            const RELOAD_THRESHOLD_MS = CONFIG.cacheTtlMs;
             const CHECK_INTERVAL_MS = 5 * 60 * 1000; // Check every 5 minutes
 
             function checkAndReload() {
-                // 1. Get Current Context
-                const searchInput = document.getElementById('citySearch');
-                const query = searchInput ? searchInput.value : '';
-                if (!query) return;
+                // Age of the data on screen (kept in memory, so other tabs and
+                // the cache don't affect it).
+                const dataAgeMs = dataTimestamp ? Date.now() - dataTimestamp : 0;
+                const stale = dataAgeMs > RELOAD_THRESHOLD_MS;
+                const canAct = navigator.onLine && !document.hidden;
 
-                // 2. Normalize Key (Match logic in fetchData)
-                const normalizedQuery = query.split('(')[0].trim();
-                const cacheKey = `ww_data_${normalizedQuery}`;
-                const cachedRaw = localStorage.getItem(cacheKey);
-
-                let dataAgeMs = 0;
-                let dataTimestamp = 0;
-
-                if (cachedRaw) {
-                    try {
-                        const parsed = JSON.parse(cachedRaw);
-                        if (parsed.timestamp) {
-                            dataTimestamp = parsed.timestamp;
-                            dataAgeMs = Date.now() - parsed.timestamp;
-                        }
-                    } catch (e) {
-                        console.warn("AutoRefresh: Failed to parse cache", e);
+                // A search that failed with nothing on screen: retry that same
+                // search in place (a reload would fall back to the saved one).
+                if (retryQuery) {
+                    if (canAct) {
+                        log(`Last load failed. Retrying "${retryQuery}"...`);
+                        fetchData(retryQuery);
                     }
+                    return;
                 }
 
                 // Detailed debug logging
@@ -1520,8 +1823,8 @@
 
                 // 3. Decision Logic
                 // If data is older than threshold AND we are online AND the page is visible...
-                if (dataAgeMs > RELOAD_THRESHOLD_MS) {
-                    if (navigator.onLine && !document.hidden) {
+                if (stale) {
+                    if (canAct) {
                         log('Data is stale. Refreshing now...');
                         // Force reload to trigger fetchData -> new API call
                         location.reload();
