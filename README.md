@@ -15,7 +15,7 @@ A real-time visualization dashboard for tracking viral loads in California waste
     *   This allows meaningful comparison between high-load viruses (like Norovirus) and low-load ones (like COVID-19) without ancient outliers distorting recent trends.
 *   **One Series per Line**:
     *   Some plants are tested by more than one lab, in units that can't be compared (e.g. copies/g of dry sludge vs copies/L of wastewater); some labs also sample upstream manholes, and some run more than one assay for the same virus.
-    *   For each plant and virus the dashboard plots a single lab + unit + site + assay series, narrowing the candidates in order: still reporting (data within 14 days of the newest sample), then samples at the plant over unlabelled over upstream sites, then within 10% of the most sample days in the last 18 months, then the most all-time sample days. Same-day samples within the series are averaged.
+    *   For each plant and virus the dashboard plots a single lab + unit + site + sample-location + assay series, narrowing the candidates in order: still reporting (data within 14 days of the newest sample), then samples at the plant over unlabelled over upstream sites, then within 10% of the most sample days in the last 18 months, then the most all-time sample days. Same-day samples within the series are averaged.
     *   A lab changing assays starts a new series, so "Recent Trend" cards are only shown for series with at least 8 weeks of history (the line is still drawn).
 *   **Non-Detects Count as Zero**:
     *   Samples where a virus wasn't found are plotted as 0, so a rare detection shows as a brief bump instead of being smoothed into a steady trend. Viruses with no detections in the selected range aren't drawn.
@@ -25,7 +25,7 @@ A real-time visualization dashboard for tracking viral loads in California waste
     *   This approach is more resilient to data anomalies than simple averaging.
 *   **Smart Caching**:
     *   To prevent API throttling and improve load times, data is cached in the browser's `localStorage` for 24 hours.
-    *   Cache is intelligently normalized by city name, so switching between facilities in the same city is instant. One city is cached at a time (a large city fills a good part of the browser's storage quota).
+    *   Cache is intelligently normalized by city name, so switching between facilities in the same city is instant. Values are kept to 4 significant digits to keep entries small; if storage fills up, other cities' entries are cleared to make room.
 *   **Interactive Visualization**:
     *   **City Autocomplete**: Search and select from all available wastewater treatment facilities across California.
     *   **Click-to-Isolate**: Click a virus in the legend to hide all others and focus on that specific trend.

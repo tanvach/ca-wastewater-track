@@ -599,10 +599,10 @@
             fallbackResourceId: '2742b824-3736-4292-90a9-7fad98e94c06',
             // Only the columns the dashboard uses. Full rows have ~100 columns
             // and are ~20x larger to download and parse. lab + units + site +
-            // assay identify which measurement series a row belongs to. These
-            // are requested by name, so if the portal renames one, every
-            // search fails with its
-            // validation error naming the column: update the name here.
+            // sample location + assay identify which measurement series a row
+            // belongs to. These are requested by name, so if the portal renames
+            // one, every search fails with its validation error naming the
+            // column: update the name here.
             columns: {
                 date: 'sample_collect_date',
                 virus: 'pcr_target',
@@ -698,36 +698,58 @@
 
         const logEl = document.getElementById('debug');
         function log(msg) {
-            logEl.innerHTML += `> ${msg}<br>`;
+            logEl.append(`> ${msg}`, document.createElement('br'));
             if (document.getElementById('debugToggle') && document.getElementById('debugToggle').checked) {
                 logEl.style.display = 'block';
             }
         }
 
         // --- 3. Dynamic Resource Logic ---
-        // Looked up once and shared by every caller. If the lookup fails, use
-        // the fallback for now and try the lookup again next time.
+        // Looked up once and shared by every caller. If the lookup fails (or
+        // takes over 10 s), the fallback ID is used and the lookup is tried
+        // again after 5 minutes. A search that gets "resource not found" clears
+        // it at once (forgetResourceId), in case the portal replaced it.
         let resourceIdPromise = null;
         function getResourceId() {
             resourceIdPromise = resourceIdPromise || (async () => {
-                // Shared by every search, so it must not hang: give up after 10 s.
-                const timeout = new AbortController();
-                const timer = setTimeout(() => timeout.abort(), 10000);
                 try {
-                    const result = await ckanGet(`${CONFIG.apiBase}/package_show?id=${CONFIG.packageId}`, timeout.signal);
+                    const result = await ckanGetWithin(`${CONFIG.apiBase}/package_show?id=${CONFIG.packageId}`, 10000);
                     // Skip resources without a live datastore: that is how the
                     // data.ca.gov copy broke (still listed, datastore removed).
                     const res = (result?.resources || []).find(r => r && r.format === 'CSV' && String(r.name || '').includes('Wastewater Surveillance') && r.datastore_active);
                     return res ? res.id : CONFIG.fallbackResourceId;
                 } catch (e) {
                     console.warn(e);
-                    resourceIdPromise = null;
+                    setTimeout(forgetResourceId, 5 * 60 * 1000);
                     return CONFIG.fallbackResourceId;
-                } finally {
-                    clearTimeout(timer);
                 }
             })();
             return resourceIdPromise;
+        }
+
+        function forgetResourceId() {
+            resourceIdPromise = null;
+        }
+
+        // ckanGet with a time limit. `signal` (a newer search) also cancels it;
+        // running out of time is reported as a network error, so a failed
+        // load can be retried.
+        async function ckanGetWithin(url, ms, signal) {
+            const ctrl = new AbortController();
+            const cancel = () => ctrl.abort();
+            if (signal?.aborted) cancel(); else signal?.addEventListener('abort', cancel);
+            const timer = setTimeout(cancel, ms);
+            try {
+                return await ckanGet(url, ctrl.signal);
+            } catch (e) {
+                if (e.name === 'AbortError' && !signal?.aborted) {
+                    throw new Error(`Network error: the data portal didn't respond within ${ms / 1000} seconds.`);
+                }
+                throw e;
+            } finally {
+                clearTimeout(timer);
+                signal?.removeEventListener('abort', cancel);
+            }
         }
 
         // GET a CKAN action URL and return its `result`, or throw an Error that
@@ -758,7 +780,7 @@
             if (!json.success) {
                 const err = json.error || {};
                 const detail = err.message || (Object.keys(err).length ? JSON.stringify(err) : `HTTP ${resp.status}`);
-                throw new Error(`API Error: ${detail}`);
+                throw Object.assign(new Error(`API Error: ${detail}`), { type: err.__type });
             }
             return json.result;
         }
@@ -789,7 +811,7 @@
                         limit: CONFIG.limit,
                         offset: records.length
                     });
-                    const result = await ckanGet(`${CONFIG.apiBase}/datastore_search?${params}`, signal);
+                    const result = await ckanGetWithin(`${CONFIG.apiBase}/datastore_search?${params}`, 60000, signal);
                     if (total === null) {
                         total = result.total;
                         if (total > CONFIG.maxRows) {
@@ -875,27 +897,37 @@
                 log(`Found ${raw.length} records.`);
                 if (raw.length === 0) throw queryError("No records found for this city.");
 
-                const nowStr = new Date().toLocaleString();
-                document.getElementById('cache-status').innerText = `Live data fetched (${nowStr})`;
-                document.getElementById('cache-status').style.color = '#2563eb'; // Blue
-
                 const cleanData = parseRawData(raw);
                 if (cleanData.length === 0) throw queryError("No usable records found for this city.");
                 const fetchedAt = Date.now();
 
-                // Cache one city at a time (a city is up to ~1.5M characters
-                // packed; localStorage holds ~2.5M in Safari, ~5M elsewhere).
+                document.getElementById('cache-status').innerText = `Live data fetched (${new Date(fetchedAt).toLocaleString()})`;
+                document.getElementById('cache-status').style.color = '#2563eb'; // Blue
+
+                // Cache it (a city is up to ~1.2M characters packed;
+                // localStorage holds ~2.5M in Safari, ~5M elsewhere). If storage
+                // is full, clear the other cities and try once more (an entry
+                // within maxCacheChars then fits). If this city can't be
+                // cached, remove its older entry so a later load doesn't bring
+                // back data older than what was just shown.
                 const entry = JSON.stringify({ timestamp: fetchedAt, data: packRows(cleanData) });
+                const dropOldEntry = () => { try { localStorage.removeItem(cacheKey); } catch (e) { /* ignore */ } };
                 if (entry.length > CONFIG.maxCacheChars) {
                     log('Too much data to cache; it will be fetched again next time.');
+                    dropOldEntry();
                 } else {
                     try {
-                        clearCityCaches(k => k === cacheKey);
                         localStorage.setItem(cacheKey, entry);
                     } catch (e) {
-                        console.warn('Not cached', e);
-                        log('Not cached (storage full); it will be fetched again next time.');
-                        try { localStorage.removeItem(cacheKey); } catch (e2) { /* ignore */ }
+                        try {
+                            clearCityCaches(k => k === cacheKey);
+                            localStorage.setItem(cacheKey, entry);
+                            log('Storage full: cleared other cities to make room.');
+                        } catch (e2) {
+                            console.warn('Not cached', e2);
+                            log('Not cached (storage full); it will be fetched again next time.');
+                            dropOldEntry();
+                        }
                     }
                 }
 
@@ -905,6 +937,8 @@
                 if (seq !== fetchSeq) return; // superseded (or aborted) by a newer search
                 document.getElementById('error').style.display = 'flex';
                 document.getElementById('error').innerText = err.message;
+                // The portal may have replaced the resource: look it up again.
+                if (err.type === 'Not Found Error') forgetResourceId();
                 // With nothing on screen, let auto-refresh retry this search.
                 // Not for a bad search: retrying that can't help.
                 if (!fullDataset.length && !err.queryError) retryQuery = query;
@@ -995,7 +1029,7 @@
                     virus: r[cols.virus],
                     val: round4(parseFloat(r[cols.value])),
                     location: r[cols.location],
-                    series: `${r[cols.lab]}|${String(r[cols.units] || '').toLowerCase()}|${r[cols.site]}|${r[cols.assay]}`,
+                    series: `${r[cols.lab]}|${String(r[cols.units] || '').toLowerCase()}|${r[cols.site]}|${siteType}|${r[cols.assay]}`,
                     // Prefer the plant's own influent over upstream manholes.
                     siteRank: siteType === 'wwtp' ? 2 : siteType === 'upstream' ? 0 : 1
                 };
@@ -1008,11 +1042,13 @@
         // copies/L wastewater), different sampling sites (plant influent vs
         // upstream manholes) and different assays (e.g. infa1 vs infa1+infa2
         // combined, whose values differ). Averaging or alternating them is
-        // meaningless, so for each plant and virus keep one lab+unit+site+assay
-        // series, chosen by narrowing the candidates step by step:
+        // meaningless, so for each plant and virus keep one lab + unit + site
+        // + sample location + assay series, chosen by narrowing the candidates
+        // step by step:
         //   1. still reporting (data within CONFIG.currentDays of the newest sample);
-        //   2. plant influent over unlabelled over upstream sites (a series
-        //      counts as influent if any of its rows is labelled so);
+        //   2. plant influent over unlabelled over upstream samples (the
+        //      sample location is part of the series: some labs report
+        //      upstream samples under the plant's site id);
         //   3. within 10% of the most sample days in the last 18 months (days,
         //      not rows: some labs send several rows per sample), so near-equal
         //      labs don't swap from one day to the next as the window moves;
@@ -1139,7 +1175,7 @@
             return raw.charAt(0).toUpperCase() + raw.slice(1);
         }
 
-        function updateStatsUI(smoothedMap, peakMap) {
+        function updateStatsUI(smoothedMap, peakMap, shortHistory = false) {
             const statsRow = document.getElementById('stats-grid');
             statsRow.innerHTML = '';
 
@@ -1176,7 +1212,8 @@
             const top3 = spikes.slice(0, 3);
 
             if (top3.length === 0) {
-                statsRow.innerHTML = '<div style="color:var(--muted); grid-column:1/-1;">No recent activity detected.</div>';
+                const msg = shortHistory ? 'Not enough history yet for recent trends.' : 'No recent activity detected.';
+                statsRow.innerHTML = `<div style="color:var(--muted); grid-column:1/-1;">${msg}</div>`;
                 return;
             }
 
@@ -1425,6 +1462,7 @@
 
             const allSmoothedMap = {};
             let anySamplesInRange = false;
+            let shortHistory = false; // a drawn virus had too little history for a card
             const allPeakMap = {};
 
             for (const { virus, rows, maxPeak } of sortedEntries) {
@@ -1458,6 +1496,8 @@
                     if (historyDays >= CONFIG.minHistoryDays) {
                         allSmoothedMap[virus] = smoothed;
                         allPeakMap[virus] = smoothPeak;
+                    } else {
+                        shortHistory = true;
                     }
 
                     const color = getVirusColor(virus);
@@ -1475,7 +1515,7 @@
             }
 
             // Update Stats UI with the EXACT smoothed data
-            updateStatsUI(allSmoothedMap, allPeakMap);
+            updateStatsUI(allSmoothedMap, allPeakMap, shortHistory);
 
             const ctx = document.getElementById('canvas').getContext('2d');
             if (chart) chart.destroy();
@@ -1769,7 +1809,7 @@
 
                 // A search that failed with nothing on screen: retry that same
                 // search in place (a reload would fall back to the saved one).
-                if (!dataTimestamp && retryQuery) {
+                if (retryQuery) {
                     if (canAct) {
                         log(`Last load failed. Retrying "${retryQuery}"...`);
                         fetchData(retryQuery);
