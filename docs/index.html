@@ -583,6 +583,16 @@
             apiBase: 'https://data.chhs.ca.gov/api/3/action',
             packageId: 'wastewater-surveillance-data-california',
             fallbackResourceId: '2742b824-3736-4292-90a9-7fad98e94c06',
+            // Only the columns the dashboard uses. Full rows have ~100 columns
+            // and are ~20x larger to download and parse.
+            columns: {
+                date: 'sample_collect_date',
+                virus: 'pcr_target',
+                value: 'pcr_target_avg_conc',
+                location: 'label_name'
+            },
+            // Rows per request. The portal caps responses at 50,000 rows, so
+            // larger cities (e.g. Santa Clara) are fetched in several pages.
             limit: 50000
         };
 
@@ -613,6 +623,31 @@
                 }
             } catch (e) { console.warn(e); }
             return CONFIG.fallbackResourceId;
+        }
+
+        // Fetch every matching row, one page at a time. Sorting by _id keeps the
+        // order stable so pages neither overlap nor skip rows.
+        async function fetchAllRecords(resourceId, query) {
+            let records = [];
+            while (true) {
+                const params = new URLSearchParams({
+                    resource_id: resourceId,
+                    q: query,
+                    fields: Object.values(CONFIG.columns).join(','),
+                    sort: '_id',
+                    limit: CONFIG.limit,
+                    offset: records.length
+                });
+                const resp = await fetch(`${CONFIG.apiBase}/datastore_search?${params}`);
+                const json = await resp.json();
+
+                if (!json.success) throw new Error(`API Error: ${json.error?.message || resp.status}`);
+
+                const page = json.result.records;
+                records = records.concat(page);
+                if (page.length === 0 || records.length >= json.result.total) return records;
+                log(`Fetched ${records.length} of ${json.result.total} records...`);
+            }
         }
 
         // --- 4. Main Data Fetch (With Caching) ---
@@ -657,14 +692,7 @@
 
                 // Fetch New - use NORMALIZED query to get all facilities for the city
                 const resourceId = await getResourceId();
-                const url = `${CONFIG.apiBase}/datastore_search?resource_id=${resourceId}&q=${encodeURIComponent(normalizedQuery)}&limit=${CONFIG.limit}`;
-
-                const resp = await fetch(url);
-                const json = await resp.json();
-
-                if (!json.success) throw new Error(`API Error: ${json.error?.message || resp.status}`);
-
-                const raw = json.result.records;
+                const raw = await fetchAllRecords(resourceId, normalizedQuery);
                 log(`Found ${raw.length} records.`);
                 if (raw.length === 0) throw new Error("No records found for this city.");
 
@@ -763,15 +791,7 @@
         }
 
         function parseRawData(raw) {
-            // Standardize Columns
-            const keys = Object.keys(raw[0]);
-            const cols = {
-                date: keys.find(k => k.match(/sample_collect_date|date/i)),
-                virus: keys.find(k => k.match(/pcr_target|pathogen|virus/i) && !k.match(/unit|gene/i)),
-                value: keys.find(k => (k.match(/pcr_target_avg_conc|concentration|copies/i) && !k.match(/method/i))),
-                location: keys.find(k => k.match(/label_name/i)) || keys.find(k => k.match(/facility_name/i)) || keys.find(k => k.match(/wwtp_name/i))
-            };
-
+            const cols = CONFIG.columns;
             return raw.map(r => ({
                 date: new Date(r[cols.date]),
                 virus: r[cols.virus],
