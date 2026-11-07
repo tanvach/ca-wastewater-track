@@ -509,14 +509,19 @@
                                 concentration (copies/L of wastewater or copies/g of sludge, depending on the lab).
                                 Ideally, we would normalize by PMMoV (a harmless fecal plant virus) to account for
                                 dilution, but PMMoV data is unavailable in this specific dataset.</li>
-                            <li style="margin-bottom: 8px;"><strong>One Lab per Line:</strong> Some plants are tested by
-                                more than one lab in units that can't be compared, so each line uses a single lab's
-                                samples from the plant itself: the one that has sampled most often over the last
-                                18 months.</li>
+                            <li style="margin-bottom: 8px;"><strong>One Series per Line:</strong> Some plants are tested
+                                by more than one lab (in units that can't be compared), at more than one site, or with
+                                more than one assay. Each line uses a single series: one that is still reporting,
+                                preferring samples taken at the plant over upstream sites, and among those the one
+                                sampled on the most days over the last 18 months (near-equal counts go to the longer
+                                history).</li>
                             <li style="margin-bottom: 8px;"><strong>Non-Detects Count:</strong> Samples where the virus
-                                wasn't found count as 0, so a rare detection shows as a brief bump, not a trend.</li>
+                                wasn't found count as 0, so a rare detection shows as a brief bump, not a trend.
+                                Viruses with no detections in the selected range aren't drawn.</li>
                             <li style="margin-bottom: 8px;"><strong>Robust Smoothing:</strong> We use a two-step filter
                                 (Median then Rolling Average) to remove single-day outliers and show the true trend.
+                                A detection among non-detects is kept, because a rare real detection and a one-off
+                                error look the same.
                             </li>
                             <li style="margin-bottom: 8px;"><strong>% of Peak:</strong> levels are shown as a percentage
                                 of the highest smoothed value observed in the last 18 months.</li>
@@ -590,8 +595,8 @@
             packageId: 'wastewater-surveillance-data-california',
             fallbackResourceId: '2742b824-3736-4292-90a9-7fad98e94c06',
             // Only the columns the dashboard uses. Full rows have ~100 columns
-            // and are ~20x larger to download and parse. lab + units + site
-            // identify which measurement series a row belongs to.
+            // and are ~20x larger to download and parse. lab + units + site +
+            // assay identify which measurement series a row belongs to.
             columns: {
                 date: 'sample_collect_date',
                 virus: 'pcr_target',
@@ -600,7 +605,8 @@
                 lab: 'lab_id',
                 units: 'pcr_target_units',
                 site: 'site_id',
-                siteType: 'sample_location' // 'wwtp' (plant influent) or 'upstream'
+                siteType: 'sample_location', // 'wwtp' (plant influent) or 'upstream'
+                assay: 'pcr_gene_target'
             },
             // Rows per request. The portal caps responses at 50,000 rows, so
             // larger cities (e.g. Santa Clara) are fetched in several pages.
@@ -674,7 +680,8 @@
         }
 
         // --- 3. Dynamic Resource Logic ---
-        // Looked up once per page load and shared by every caller.
+        // A successful lookup is shared by every caller for the rest of the
+        // page's life; a failed one falls back for now and is retried next time.
         let resourceIdPromise = null;
         function getResourceId() {
             resourceIdPromise ??= (async () => {
@@ -685,6 +692,7 @@
                     const res = (result.resources || []).find(r => r.format === 'CSV' && r.name.includes('Wastewater Surveillance') && r.datastore_active);
                     if (res) return res.id;
                 } catch (e) { console.warn(e); }
+                resourceIdPromise = null;
                 return CONFIG.fallbackResourceId;
             })();
             return resourceIdPromise;
@@ -693,21 +701,26 @@
         // GET a CKAN action URL and return its `result`, or throw an Error that
         // carries the portal's own reason (CKAN validation errors have no
         // `message`, and proxies/CDNs can answer with non-JSON pages).
-        async function ckanGet(url) {
+        async function ckanGet(url, signal) {
             let resp;
             try {
-                resp = await fetch(url);
+                resp = await fetch(url, { signal });
             } catch (e) {
+                if (e.name === 'AbortError') throw e;
                 throw new Error(`Network error: couldn't reach the data portal (${e.message}).`);
             }
             let json;
             try {
                 json = await resp.json();
             } catch (e) {
-                // A 2xx whose body can't be read was cut off mid-download;
-                // anything else is an error page that isn't JSON.
-                if (resp.ok) throw new Error(`Network error: the response was cut off (${e.message}).`);
-                throw new Error(`API Error: HTTP ${resp.status} ${resp.statusText}`.trim());
+                if (e.name === 'AbortError') throw e;
+                // A JSON response whose body can't be parsed was cut off
+                // mid-download; anything else is a page that isn't the API's
+                // (an error page, or a proxy/captive-portal page).
+                if (resp.ok && /json/i.test(resp.headers.get('content-type') || '')) {
+                    throw new Error(`Network error: the response was cut off (${e.message}).`);
+                }
+                throw new Error(`API Error: unexpected non-JSON response (HTTP ${resp.status} ${resp.statusText})`.replace(' )', ')'));
             }
             if (!json.success) {
                 const err = json.error || {};
@@ -723,13 +736,12 @@
         // portal reloaded the table, so start over rather than mix snapshots.
         // Rows come back as arrays (records_format=lists, about half the JSON
         // of objects) and are turned into objects keyed by column name.
-        // Returns null if isStale() says a newer search has replaced this one.
-        async function fetchAllRecords(resourceId, query, onProgress, isStale) {
+        // `signal` cancels in-flight and later page requests.
+        async function fetchAllRecords(resourceId, query, onProgress, signal) {
             for (let attempt = 0; attempt < 2; attempt++) {
                 const records = [];
                 let total = null;
                 while (true) {
-                    if (isStale?.()) return null;
                     const params = new URLSearchParams({
                         resource_id: resourceId,
                         q: query,
@@ -739,7 +751,7 @@
                         limit: CONFIG.limit,
                         offset: records.length
                     });
-                    const result = await ckanGet(`${CONFIG.apiBase}/datastore_search?${params}`);
+                    const result = await ckanGet(`${CONFIG.apiBase}/datastore_search?${params}`, signal);
                     if (total === null) {
                         total = result.total;
                         if (total > CONFIG.maxRows) {
@@ -764,11 +776,15 @@
 
         // --- 4. Main Data Fetch (With Caching) ---
         // Each fetchData call takes a number; only the latest call may render,
-        // so a slow earlier search can't overwrite a newer one.
+        // so a slow earlier search can't overwrite a newer one. Starting a new
+        // search also aborts the previous one's downloads.
         let fetchSeq = 0;
+        let fetchAbort = null;
 
         async function fetchData(query) {
             const seq = ++fetchSeq;
+            fetchAbort?.abort();
+            const abort = fetchAbort = new AbortController();
             document.getElementById('loading').style.display = 'flex';
             document.getElementById('error').style.display = 'none';
             document.getElementById('loading-text').innerText = `Searching for "${query}"...`;
@@ -787,7 +803,7 @@
                         const age = Date.now() - parsed.timestamp;
                         if (age < 1000 * 60 * 60 * 24) { // 24 hours
                             // Check the cached location list before unpacking every row
-                            if (selectedFacility && parsed.data.location.includes(selectedFacility)) {
+                            if (parsed.data && selectedFacility && parsed.data.location.includes(selectedFacility)) {
                                 const rehydrated = unpackRows(parsed.data);
                                 log(`Using cached data (${(age / 3600000).toFixed(1)}h old)`);
                                 const dateStr = new Date(parsed.timestamp).toLocaleString([], { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
@@ -809,7 +825,7 @@
                     if (seq !== fetchSeq) return;
                     document.getElementById('loading-text').innerText = `Loading ${done.toLocaleString()} of ${total.toLocaleString()} records...`;
                     log(`Fetched ${done} of ${total} records...`);
-                }, () => seq !== fetchSeq);
+                }, abort.signal);
                 if (seq !== fetchSeq) return; // a newer search started meanwhile
                 log(`Found ${raw.length} records.`);
                 if (raw.length === 0) throw new Error("No records found for this city.");
@@ -822,24 +838,33 @@
 
                 // Save to Cache (Minimal Data). A city can take a few MB, so if
                 // storage is full, drop other cities' caches and try once more.
-                // Entries too big to ever fit (~5 MB per site) aren't attempted,
-                // so they can't wipe the other cities for nothing.
+                // Entries that can't fit even in an empty store (Safari allows
+                // ~2.5M characters) aren't attempted, so they can't wipe the
+                // other cities for nothing. If the data isn't cached, a
+                // timestamp-only entry is kept so the daily auto-refresh still
+                // sees when the data was fetched.
                 const entry = JSON.stringify({ timestamp: Date.now(), data: packRows(cleanData) });
-                if (entry.length > 4000000) {
-                    log('Too much data to cache; it will be fetched again next time.');
-                } else try {
-                    localStorage.setItem(cacheKey, entry);
-                } catch (e) {
+                let cachedOk = false;
+                if (entry.length <= 2400000) {
                     try {
-                        Object.keys(localStorage)
-                            .filter(k => k.startsWith('ww_data_') && k !== cacheKey)
-                            .forEach(k => localStorage.removeItem(k));
                         localStorage.setItem(cacheKey, entry);
-                        log('Cache full: cleared other cities to make room.');
-                    } catch (e2) {
-                        console.warn("Cache full", e2);
-                        log("Warning: Cache full, performance may degrade on reload.");
+                        cachedOk = true;
+                    } catch (e) {
+                        try {
+                            Object.keys(localStorage)
+                                .filter(k => k.startsWith('ww_data_') && k !== cacheKey)
+                                .forEach(k => localStorage.removeItem(k));
+                            localStorage.setItem(cacheKey, entry);
+                            cachedOk = true;
+                            log('Cache full: cleared other cities to make room.');
+                        } catch (e2) { console.warn("Cache full", e2); }
                     }
+                }
+                if (!cachedOk) {
+                    log('Not cached (too large); it will be fetched again next time.');
+                    try {
+                        localStorage.setItem(cacheKey, JSON.stringify({ timestamp: Date.now(), data: null }));
+                    } catch (e) { console.warn(e); }
                 }
 
                 initWithData(cleanData);
@@ -930,7 +955,7 @@
                     virus: r[cols.virus],
                     val: parseFloat(r[cols.value]),
                     location: r[cols.location],
-                    series: `${r[cols.lab]}|${String(r[cols.units] || '').toLowerCase()}|${r[cols.site]}`,
+                    series: `${r[cols.lab]}|${String(r[cols.units] || '').toLowerCase()}|${r[cols.site]}|${r[cols.assay]}`,
                     // Prefer the plant's own influent over upstream manholes.
                     siteRank: siteType === 'wwtp' ? 2 : siteType === 'upstream' ? 0 : 1
                 };
@@ -940,16 +965,18 @@
 
         // A plant can have several measurement series for one virus: different
         // labs with units that can't be compared (e.g. copies/g dry sludge vs
-        // copies/L wastewater), and different sampling sites (plant influent vs
-        // upstream manholes). Averaging or alternating them is meaningless, so
-        // for each plant and virus keep one lab+unit+site series, ranked by:
-        //   1. plant influent over unlabelled over upstream sites;
-        //   2. still reporting (data within 30 days of the newest sample);
-        //   3. most sample days in the last 18 months (days, not rows: some
-        //      labs send several rows per sample). Counts within 10% are a tie,
-        //      broken by all-time sample days, so near-equal labs don't swap
-        //      from one day to the next as the window moves;
-        //   4. most recent data.
+        // copies/L wastewater), different sampling sites (plant influent vs
+        // upstream manholes) and different assays (e.g. infa1 vs infa1+infa2
+        // combined). Averaging or alternating them is meaningless, so
+        // for each plant and virus keep one lab+unit+site+assay series, chosen
+        // by narrowing the candidates step by step:
+        //   1. still reporting (data within 30 days of the newest sample);
+        //   2. plant influent over unlabelled over upstream sites (a series
+        //      counts as influent if any of its rows is labelled so);
+        //   3. within 10% of the most sample days in the last 18 months (days,
+        //      not rows: some labs send several rows per sample), so near-equal
+        //      labs don't swap from one day to the next as the window moves;
+        //   4. then the most all-time sample days, most recent days, latest data.
         function keepOneSeries(rows) {
             const DAY = 24 * 60 * 60 * 1000;
             const since = new Date();
@@ -960,8 +987,9 @@
                 const key = `${r.location}|${r.virus}`;
                 if (!stats.has(key)) stats.set(key, new Map());
                 const bySeries = stats.get(key);
-                const s = bySeries.get(r.series) || { siteRank: r.siteRank, days: new Set(), allDays: new Set(), last: 0 };
+                const s = bySeries.get(r.series) || { siteRank: 0, days: new Set(), allDays: new Set(), last: 0 };
                 const t = r.date.getTime();
+                s.siteRank = Math.max(s.siteRank, r.siteRank);
                 s.allDays.add(t);
                 if (r.date >= since) s.days.add(t);
                 s.last = Math.max(s.last, t);
@@ -970,19 +998,15 @@
 
             const chosen = new Map();
             for (const [key, bySeries] of stats) {
-                const newest = Math.max(...[...bySeries.values()].map(s => s.last));
-                const current = s => (s.last >= newest - 30 * DAY ? 1 : 0);
-                const byDays = (a, b) => {
-                    const x = a.days.size, y = b.days.size;
-                    if (Math.abs(x - y) > 0.1 * Math.max(x, y)) return x - y;
-                    return (a.allDays.size - b.allDays.size) || (x - y);
-                };
-                const compare = (a, b) => (a.siteRank - b.siteRank) || (current(a) - current(b)) || byDays(a, b) || (a.last - b.last);
-                let best = null;
-                for (const [series, s] of bySeries) {
-                    if (!best || compare(s, best.s) > 0) best = { series, s };
-                }
-                chosen.set(key, best.series);
+                let candidates = [...bySeries].map(([series, s]) => ({ series, ...s }));
+                const newest = Math.max(...candidates.map(c => c.last));
+                candidates = candidates.filter(c => c.last >= newest - 30 * DAY);
+                const bestRank = Math.max(...candidates.map(c => c.siteRank));
+                candidates = candidates.filter(c => c.siteRank === bestRank);
+                const mostDays = Math.max(...candidates.map(c => c.days.size));
+                candidates = candidates.filter(c => c.days.size >= 0.9 * mostDays);
+                candidates.sort((a, b) => (b.allDays.size - a.allDays.size) || (b.days.size - a.days.size) || (b.last - a.last));
+                chosen.set(key, candidates[0].series);
             }
             return rows.filter(r => chosen.get(`${r.location}|${r.virus}`) === r.series);
         }
@@ -1389,7 +1413,9 @@
                         raw: p.val, // This is the smoothed ratio
                     }));
 
-                if (points.length > 0) {
+                // Hide viruses with no detections in the shown range (all-zero
+                // lines carry no information and crowd the legend).
+                if (points.some(p => p.y > 0)) {
                     const color = getVirusColor(virus);
                     datasets.push({
                         label: formatLabel(virus),

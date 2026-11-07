@@ -13,14 +13,14 @@ A real-time visualization dashboard for tracking viral loads in California waste
 *   **Adaptive Baseline**:
     *   Data is normalized to the **% of Peak in the Last 18 Months**.
     *   This allows meaningful comparison between high-load viruses (like Norovirus) and low-load ones (like COVID-19) without ancient outliers distorting recent trends.
-*   **One Lab per Line**:
-    *   Some plants are tested by more than one lab, in units that can't be compared (e.g. copies/g of dry sludge vs copies/L of wastewater), and some labs also sample upstream manholes.
-    *   For each plant and virus the dashboard plots a single lab + unit + site series: the plant's own influent first, then a lab still reporting (within 30 days), then the one with the most sample days in the last 18 months. Same-day samples are averaged.
+*   **One Series per Line**:
+    *   Some plants are tested by more than one lab, in units that can't be compared (e.g. copies/g of dry sludge vs copies/L of wastewater); some labs also sample upstream manholes, and some run more than one assay for the same virus.
+    *   For each plant and virus the dashboard plots a single lab + unit + site + assay series, narrowing the candidates in order: still reporting (data within 30 days of the newest sample), then samples at the plant over unlabelled over upstream sites, then within 10% of the most sample days in the last 18 months, then the most all-time sample days. Same-day samples within the series are averaged.
 *   **Non-Detects Count as Zero**:
-    *   Samples where a virus wasn't found are plotted as 0, so a rare detection shows as a brief bump instead of being smoothed into a steady trend.
+    *   Samples where a virus wasn't found are plotted as 0, so a rare detection shows as a brief bump instead of being smoothed into a steady trend. Viruses with no detections in the selected range aren't drawn.
 *   **Robust Smoothing Algorithm**:
     *   **Two-Step Filter**: Combines a 5-day rolling median (to remove single-day outliers) followed by a 7-day rolling average (to show clear trends).
-    *   The median never turns a day with a detection into 0, so detections among mostly-zero samples stay visible.
+    *   The median never turns a day with a detection into 0, so detections among mostly-zero samples stay visible. The trade-off: a one-off bad reading among non-detects isn't removed either, since it can't be told apart from a real rare detection.
     *   This approach is more resilient to data anomalies than simple averaging.
 *   **Smart Caching**:
     *   To prevent API throttling and improve load times, data is cached in the browser's `localStorage` for 24 hours.
