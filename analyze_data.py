@@ -1,25 +1,15 @@
-import requests
-import json
-import collections
+import ckan
 
 # Config
-API_BASE = 'https://data.chhs.ca.gov/api/3/action'
-RESOURCE_ID = '2742b824-3736-4292-90a9-7fad98e94c06'
 QUERY = 'San Francisco'
 
 def analyze_data():
     print(f"Fetching data for query: '{QUERY}'...")
-    url = f"{API_BASE}/datastore_search?resource_id={RESOURCE_ID}&q={QUERY}&limit=100"
-    
-    try:
-        r = requests.get(url)
-        data = r.json()
-        
-        if not data['success']:
-            print("API Error:", data.get('error'))
-            return
 
-        records = data['result']['records']
+    try:
+        # A sample of full rows (all columns), to inspect the schema.
+        result = ckan.call('datastore_search', resource_id=ckan.resource_id(), q=QUERY, limit=100)
+        records = result['records']
         print(f"Fetched {len(records)} records.\n")
         
         if not records:

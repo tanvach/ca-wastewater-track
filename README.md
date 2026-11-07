@@ -25,6 +25,7 @@ A real-time visualization dashboard for tracking viral loads in California waste
     *   This approach is more resilient to data anomalies than simple averaging.
 *   **Smart Caching**:
     *   To prevent API throttling and improve load times, data is cached in the browser's `localStorage` for 24 hours.
+    *   If the data portal can't be reached, the city's last cached data is shown instead, labelled with its date (hover for the reason). Once that data is over a day old, the dashboard retries every few minutes; "Check for Updates" tries again at any time.
     *   Cache is intelligently normalized by city name, so switching between facilities in the same city is instant. Values are kept to 4 significant digits to keep entries small; if storage fills up, other cities' entries are cleared to make room.
 *   **Interactive Visualization**:
     *   **City Autocomplete**: Search and select from all available wastewater treatment facilities across California.
