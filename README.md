@@ -1,6 +1,6 @@
 # CA Wastewater Virus Tracker
 
-A real-time visualization dashboard for tracking viral loads in California wastewater, powered by the [CDPH Open Data API](https://data.ca.gov/dataset/wastewater-surveillance-data-california).
+A real-time visualization dashboard for tracking viral loads in California wastewater, powered by the [CDPH Open Data API](https://data.chhs.ca.gov/dataset/wastewater-surveillance-data-california).
 
 🔗 **Live Dashboard:** [https://tanvach.github.io/ca-wastewater-track/](https://tanvach.github.io/ca-wastewater-track/)
 
@@ -38,7 +38,7 @@ This is a static HTML/JS application with no build steps required.
 
 ## 📡 Data Source
 
-Data is sourced directly from the California Department of Public Health (CDPH) [CKAN API](https://data.ca.gov/api/3/action/package_show?id=cdph-wastewater-surveillance-data-california).
+Data is sourced directly from the California Department of Public Health (CDPH) [CKAN API](https://data.chhs.ca.gov/api/3/action/package_show?id=wastewater-surveillance-data-california) on the CalHHS Open Data Portal.
 
 > [!IMPORTANT]
 > **Dataset Limitations**: This dataset is a subset of the data collected by the [WastewaterSCAN](https://wastewaterscan.org/) project. Crucially, it **does not include PMMoV (fecal normalization) data** for many sites.

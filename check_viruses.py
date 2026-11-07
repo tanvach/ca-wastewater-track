@@ -2,8 +2,8 @@ import requests
 import json
 
 # Config
-API_BASE = 'https://data.ca.gov/api/3/action'
-RESOURCE_ID = '49a3fc6f-e52d-4e4a-a9ee-9c9e4a5cc771'
+API_BASE = 'https://data.chhs.ca.gov/api/3/action'
+RESOURCE_ID = '2742b824-3736-4292-90a9-7fad98e94c06'
 QUERY = 'San Francisco'
 
 def check_viruses():
