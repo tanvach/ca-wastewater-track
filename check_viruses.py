@@ -1,57 +1,18 @@
-import requests
-import json
+import ckan
 
 # Config
-API_BASE = 'https://data.chhs.ca.gov/api/3/action'
-RESOURCE_ID = '2742b824-3736-4292-90a9-7fad98e94c06'
 QUERY = 'San Francisco'
+
 
 def check_viruses():
     print(f"Fetching unique viruses for: '{QUERY}'...")
     try:
-        # Page through every match: the portal caps each response at 50,000
-        # rows, and a single truncated page can miss targets.
-        records = []
-        while True:
-            r = requests.get(f"{API_BASE}/datastore_search", params={
-                'resource_id': RESOURCE_ID, 'q': QUERY, 'sort': '_id',
-                'limit': 50000, 'offset': len(records)})
-            data = r.json()
-
-            if not data['success']:
-                print("API Error:", data.get('error'))
-                return
-
-            page = data['result']['records']
-            records.extend(page)
-            if not page or len(records) >= data['result']['total']:
-                break
-
+        # Every matching row, but only the target column (a few bytes a row,
+        # instead of ~100 columns).
+        records = ckan.search(QUERY, fields=['pcr_target'])
         print(f"Fetched {len(records)} records.")
-        
-        # Find the virus column (likely 'pcr_target' or similar)
-        if not records:
-            print("No records.")
-            return
 
-        keys = records[0].keys()
-        # Better column detection
-        virus_col = next((k for k in keys if 'pcr_target' in k.lower() and 'unit' not in k.lower() and 'avg' not in k.lower()), None)
-        if not virus_col:
-             virus_col = next((k for k in keys if 'target' in k.lower() and 'unit' not in k.lower() and 'rec_eff' not in k.lower() and 'hum_frac' not in k.lower()), None)
-        
-        if not virus_col:
-            print("Could not identify virus column.")
-            print("Keys:", keys)
-            return
-
-        # Extract unique values
-        unique_viruses = set()
-        for row in records:
-            # Filter for "Southeast" just to match user's context, or check all SF
-            # Let's check ALL SF to be thorough
-            if row.get(virus_col):
-                unique_viruses.add(row[virus_col])
+        unique_viruses = {row['pcr_target'] for row in records if row.get('pcr_target')}
 
         print(f"\nUnique Viruses Found in CDPH Data ({len(unique_viruses)}):")
         for v in sorted(unique_viruses):
@@ -66,6 +27,7 @@ def check_viruses():
 
     except Exception as e:
         print(f"Script failed: {e}")
+
 
 if __name__ == "__main__":
     check_viruses()
