@@ -614,6 +614,15 @@
             // Refuse searches broader than this. The largest city is ~65k
             // rows; one-word searches like "San" match 140k+.
             maxRows: 100000,
+            // Columns needed to draw anything; the rest only pick a series. If
+            // the portal rejects the full list (a column was renamed), we retry
+            // with these and plot one series per plant and virus.
+            coreColumns: ['date', 'virus', 'value', 'location'],
+            // "% of peak" baseline and series-selection window.
+            baselineMonths: 18,
+            // A series counts as still reporting with data this recent relative
+            // to the newest sample (matches the 14-day staleness of the cards).
+            currentDays: 14,
             // Bump when the shape or meaning of cached data changes.
             cachePrefix: 'ww_data_v2_'
         };
@@ -629,11 +638,16 @@
             return CONFIG.cachePrefix + coreName(query);
         }
 
+        // Remove cached city data, except the entries `keep` returns true for.
+        function clearCityCaches(keep) {
+            Object.keys(localStorage)
+                .filter(k => k.startsWith('ww_data_') && !keep(k))
+                .forEach(k => localStorage.removeItem(k));
+        }
+
         // Drop city caches written in an older format; they're never read.
         try {
-            Object.keys(localStorage)
-                .filter(k => k.startsWith('ww_data_') && !k.startsWith(CONFIG.cachePrefix))
-                .forEach(k => localStorage.removeItem(k));
+            clearCityCaches(k => k.startsWith(CONFIG.cachePrefix));
         } catch (e) { console.warn(e); }
 
         // Cached rows are stored compactly ([minutes, virus#, location#, value]
@@ -670,6 +684,7 @@
         let chart = null;
         let currentMonths = 3;
         let currentQuery = '';
+        let labelsPromise = null; // see getLabels()
 
         const logEl = document.getElementById('debug');
         function log(msg) {
@@ -684,7 +699,7 @@
         // page's life; a failed one falls back for now and is retried next time.
         let resourceIdPromise = null;
         function getResourceId() {
-            resourceIdPromise ??= (async () => {
+            resourceIdPromise = resourceIdPromise || (async () => {
                 try {
                     const result = await ckanGet(`${CONFIG.apiBase}/package_show?id=${CONFIG.packageId}`);
                     // Skip resources without a live datastore: that is how the
@@ -720,56 +735,86 @@
                 if (resp.ok && /json/i.test(resp.headers.get('content-type') || '')) {
                     throw new Error(`Network error: the response was cut off (${e.message}).`);
                 }
-                throw new Error(`API Error: unexpected non-JSON response (HTTP ${resp.status} ${resp.statusText})`.replace(' )', ')'));
+                const status = [resp.status, resp.statusText].filter(Boolean).join(' ');
+                throw new Error(`API Error: unexpected non-JSON response (HTTP ${status})`);
             }
             if (!json.success) {
                 const err = json.error || {};
                 const detail = err.message || (Object.keys(err).length ? JSON.stringify(err) : `HTTP ${resp.status}`);
-                throw new Error(`API Error: ${detail}`);
+                throw Object.assign(new Error(`API Error: ${detail}`), { ckan: err });
             }
             return json.result;
         }
 
-        // Fetch every matching row, one page at a time (the portal caps each
-        // response at CONFIG.limit rows). Sorting by _id keeps pages from
-        // overlapping or skipping rows; if the total changes between pages the
-        // portal reloaded the table, so start over rather than mix snapshots.
-        // Rows come back as arrays (records_format=lists, about half the JSON
-        // of objects) and are turned into objects keyed by column name.
-        // `signal` cancels in-flight and later page requests.
-        async function fetchAllRecords(resourceId, query, onProgress, signal) {
+        // Fetch every row for a city. Known cities are matched exactly by their
+        // facility labels (`labels`, sent as filters); anything else falls back
+        // to a full-text search, refused if it matches more than CONFIG.maxRows.
+        // The portal caps each response (CONFIG.limit rows): the first page
+        // gives the total and the page size, then the rest are fetched in
+        // parallel. Sorting by _id keeps pages from overlapping or skipping
+        // rows; if the total differs between pages the portal reloaded the
+        // table, so start over rather than mix snapshots. Rows come back as
+        // arrays (records_format=lists, about half the JSON of objects) and are
+        // turned into objects keyed by column name. `signal` cancels requests.
+        async function fetchAllRecords(resourceId, query, labels, onProgress, signal) {
+            const byLabel = labels && labels.length > 0;
+            let columns = Object.values(CONFIG.columns);
+            const page = offset => {
+                const params = new URLSearchParams({
+                    resource_id: resourceId,
+                    fields: columns.join(','),
+                    sort: '_id',
+                    records_format: 'lists',
+                    limit: CONFIG.limit,
+                    offset
+                });
+                if (byLabel) params.set('filters', JSON.stringify({ [CONFIG.columns.location]: labels }));
+                else params.set('q', query);
+                return ckanGet(`${CONFIG.apiBase}/datastore_search?${params}`, signal);
+            };
+
             for (let attempt = 0; attempt < 2; attempt++) {
+                let first;
+                try {
+                    first = await page(0);
+                } catch (e) {
+                    // A renamed or removed column: plot without series details
+                    // rather than not at all.
+                    if (!e.ckan?.fields || columns.length === CONFIG.coreColumns.length) throw e;
+                    log(`Columns rejected (${JSON.stringify(e.ckan.fields)}); loading without series details.`);
+                    columns = CONFIG.coreColumns.map(c => CONFIG.columns[c]);
+                    first = await page(0);
+                }
+                const total = first.total;
+                if (!byLabel && total > CONFIG.maxRows) {
+                    throw Object.assign(new Error(`"${query}" matches ${total.toLocaleString()} records. Please pick a specific facility from the list.`), { badQuery: true });
+                }
+
+                const step = first.records.length;
+                const offsets = [];
+                for (let o = step; step > 0 && o < total; o += step) offsets.push(o);
+                let loaded = step;
+                if (offsets.length) onProgress?.(loaded, total);
+                const rest = await Promise.all(offsets.map(o => page(o).then(r => {
+                    loaded += r.records.length;
+                    onProgress?.(Math.min(loaded, total), total);
+                    return r;
+                })));
+                if (rest.some(r => r.total !== total)) {
+                    log('Dataset changed while loading; starting over.');
+                    continue;
+                }
+
                 const records = [];
-                let total = null;
-                while (true) {
-                    const params = new URLSearchParams({
-                        resource_id: resourceId,
-                        q: query,
-                        fields: Object.values(CONFIG.columns).join(','),
-                        sort: '_id',
-                        records_format: 'lists',
-                        limit: CONFIG.limit,
-                        offset: records.length
-                    });
-                    const result = await ckanGet(`${CONFIG.apiBase}/datastore_search?${params}`, signal);
-                    if (total === null) {
-                        total = result.total;
-                        if (total > CONFIG.maxRows) {
-                            throw new Error(`"${query}" matches ${total.toLocaleString()} records. Please pick a specific facility from the list.`);
-                        }
-                    } else if (result.total !== total) {
-                        break;
-                    }
+                for (const result of [first, ...rest]) {
                     const names = result.fields.map(f => f.id);
                     for (const row of result.records) {
                         const r = {};
                         names.forEach((name, i) => { r[name] = row[i]; });
                         records.push(r);
                     }
-                    if (result.records.length === 0 || records.length >= total) return records;
-                    onProgress?.(records.length, total);
                 }
-                log('Dataset changed while loading; starting over.');
+                return records;
             }
             throw new Error('API Error: the dataset was being updated. Please try again in a minute.');
         }
@@ -791,7 +836,7 @@
 
             try {
                 const normalizedQuery = coreName(query);
-                if (!normalizedQuery) throw new Error('Enter a city or facility name.');
+                if (!normalizedQuery) throw Object.assign(new Error('Enter a city or facility name.'), { badQuery: true });
                 const cacheKey = cacheKeyFor(query);
                 const cached = localStorage.getItem(cacheKey);
                 const selectedFacility = localStorage.getItem('lastLocation');
@@ -803,7 +848,9 @@
                         const age = Date.now() - parsed.timestamp;
                         if (age < 1000 * 60 * 60 * 24) { // 24 hours
                             // Check the cached location list before unpacking every row
-                            if (parsed.data && selectedFacility && parsed.data.location.includes(selectedFacility)) {
+                            // A typed city name ("Santa Clara") matches its facilities too.
+                            const wanted = selectedFacility && coreName(selectedFacility).toLowerCase();
+                            if (parsed.data && selectedFacility && parsed.data.location.some(l => l === selectedFacility || coreName(l).toLowerCase() === wanted)) {
                                 const rehydrated = unpackRows(parsed.data);
                                 log(`Using cached data (${(age / 3600000).toFixed(1)}h old)`);
                                 const dateStr = new Date(parsed.timestamp).toLocaleString([], { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
@@ -821,7 +868,10 @@
 
                 // Fetch New - use NORMALIZED query to get all facilities for the city
                 const resourceId = await getResourceId();
-                const raw = await fetchAllRecords(resourceId, normalizedQuery, (done, total) => {
+                // Fetch the city's facilities by exact label when we know them.
+                const labels = (await getLabels()).filter(l => coreName(l).toLowerCase() === normalizedQuery.toLowerCase());
+                if (labels.length && query.includes('(') && !labels.includes(query)) labels.push(query);
+                const raw = await fetchAllRecords(resourceId, normalizedQuery, labels, (done, total) => {
                     if (seq !== fetchSeq) return;
                     document.getElementById('loading-text').innerText = `Loading ${done.toLocaleString()} of ${total.toLocaleString()} records...`;
                     log(`Fetched ${done} of ${total} records...`);
@@ -851,9 +901,7 @@
                         cachedOk = true;
                     } catch (e) {
                         try {
-                            Object.keys(localStorage)
-                                .filter(k => k.startsWith('ww_data_') && k !== cacheKey)
-                                .forEach(k => localStorage.removeItem(k));
+                                clearCityCaches(k => k === cacheKey);
                             localStorage.setItem(cacheKey, entry);
                             cachedOk = true;
                             log('Cache full: cleared other cities to make room.');
@@ -868,11 +916,13 @@
                 }
 
                 initWithData(cleanData);
+                return 'ok';
 
             } catch (err) {
                 if (seq !== fetchSeq) return;
                 document.getElementById('error').style.display = 'flex';
                 document.getElementById('error').innerText = err.message;
+                return err.badQuery ? 'badQuery' : 'error';
             } finally {
                 if (seq === fetchSeq) document.getElementById('loading').style.display = 'none';
             }
@@ -959,7 +1009,7 @@
                     // Prefer the plant's own influent over upstream manholes.
                     siteRank: siteType === 'wwtp' ? 2 : siteType === 'upstream' ? 0 : 1
                 };
-            }).filter(d => !isNaN(d.val) && d.val >= 0 && d.location);
+            }).filter(d => !isNaN(d.val) && d.val >= 0 && d.location && !isNaN(d.date.getTime()));
             return keepOneSeries(rows).map(({ series, siteRank, ...d }) => d);
         }
 
@@ -970,7 +1020,7 @@
         // combined). Averaging or alternating them is meaningless, so
         // for each plant and virus keep one lab+unit+site+assay series, chosen
         // by narrowing the candidates step by step:
-        //   1. still reporting (data within 30 days of the newest sample);
+        //   1. still reporting (data within CONFIG.currentDays of the newest sample);
         //   2. plant influent over unlabelled over upstream sites (a series
         //      counts as influent if any of its rows is labelled so);
         //   3. within 10% of the most sample days in the last 18 months (days,
@@ -980,7 +1030,7 @@
         function keepOneSeries(rows) {
             const DAY = 24 * 60 * 60 * 1000;
             const since = new Date();
-            since.setMonth(since.getMonth() - 18);
+            since.setMonth(since.getMonth() - CONFIG.baselineMonths);
 
             const stats = new Map(); // "location|virus" -> Map(series -> stats)
             for (const r of rows) {
@@ -1000,7 +1050,7 @@
             for (const [key, bySeries] of stats) {
                 let candidates = [...bySeries].map(([series, s]) => ({ series, ...s }));
                 const newest = Math.max(...candidates.map(c => c.last));
-                candidates = candidates.filter(c => c.last >= newest - 30 * DAY);
+                candidates = candidates.filter(c => c.last >= newest - CONFIG.currentDays * DAY);
                 const bestRank = Math.max(...candidates.map(c => c.siteRank));
                 candidates = candidates.filter(c => c.siteRank === bestRank);
                 const mostDays = Math.max(...candidates.map(c => c.days.size));
@@ -1013,13 +1063,20 @@
 
         // --- 5. UI Logic ---
 
-        function runNewSearch(val) {
+        async function runNewSearch(val) {
             if (!val) return;
+            const previous = { lastSearch: localStorage.getItem('lastSearch'), lastLocation: localStorage.getItem('lastLocation') };
             currentQuery = val;
             localStorage.setItem('lastSearch', val);
             // Save the selected facility so initWithData can use it
             localStorage.setItem('lastLocation', val);
-            fetchData(val);
+            // Don't keep a search that can never load (empty or too broad), or
+            // every reload would show the same error.
+            if (await fetchData(val) === 'badQuery') {
+                for (const [k, v] of Object.entries(previous)) {
+                    if (v === null) localStorage.removeItem(k); else localStorage.setItem(k, v);
+                }
+            }
         }
 
         function updateTimeRange(m) {
@@ -1131,7 +1188,7 @@
                 // If data is older than 14 days, don't show as a "Recent Spike"
                 if (diffDays > 14) continue;
 
-                if (peakVal > 0) {
+                if (peakVal > 0 && latestPoint.val > 0) {
                     spikes.push({
                         virus: virus,
                         label: formatLabel(virus),
@@ -1361,7 +1418,7 @@
             const datasets = [];
 
             // Adaptive Baseline
-            const baselineMonths = Math.max(currentMonths, 18);
+            const baselineMonths = Math.max(currentMonths, CONFIG.baselineMonths);
             const baselineDate = new Date();
             baselineDate.setMonth(baselineDate.getMonth() - baselineMonths);
 
@@ -1401,10 +1458,6 @@
                 // Fallback
                 if (smoothPeak === 0) smoothPeak = maxPeak;
 
-                // Collect for Stats UI
-                allSmoothedMap[virus] = smoothed;
-                allPeakMap[virus] = smoothPeak;
-
                 const points = smoothed
                     .filter(p => p.date >= cutoff)
                     .map(p => ({
@@ -1416,6 +1469,10 @@
                 // Hide viruses with no detections in the shown range (all-zero
                 // lines carry no information and crowd the legend).
                 if (points.some(p => p.y > 0)) {
+                    // Stats cards cover exactly the drawn viruses
+                    allSmoothedMap[virus] = smoothed;
+                    allPeakMap[virus] = smoothPeak;
+
                     const color = getVirusColor(virus);
                     datasets.push({
                         label: formatLabel(virus),
@@ -1572,6 +1629,16 @@
         const suggestionsContainer = document.getElementById('suggestions');
         let activeSuggestionIndex = -1;
 
+        // Facility labels, loaded once and shared by autocomplete and fetchData
+        // (which uses them to fetch a city by exact label). Retried if empty.
+        function getLabels() {
+            labelsPromise = labelsPromise || fetchAutocompleteLabels().then(() => {
+                if (!allAvailableLabels.length) labelsPromise = null;
+                return allAvailableLabels;
+            });
+            return labelsPromise;
+        }
+
         async function fetchAutocompleteLabels() {
             const cacheKey = 'ww_available_labels';
             const cached = localStorage.getItem(cacheKey);
@@ -1708,7 +1775,7 @@
             }
         });
 
-        fetchAutocompleteLabels();
+        getLabels();
 
         // --- 9. Robust Auto-Refresh Logic (Data Age Based) ---
         function initAutoRefresh() {

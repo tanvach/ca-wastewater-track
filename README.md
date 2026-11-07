@@ -15,7 +15,7 @@ A real-time visualization dashboard for tracking viral loads in California waste
     *   This allows meaningful comparison between high-load viruses (like Norovirus) and low-load ones (like COVID-19) without ancient outliers distorting recent trends.
 *   **One Series per Line**:
     *   Some plants are tested by more than one lab, in units that can't be compared (e.g. copies/g of dry sludge vs copies/L of wastewater); some labs also sample upstream manholes, and some run more than one assay for the same virus.
-    *   For each plant and virus the dashboard plots a single lab + unit + site + assay series, narrowing the candidates in order: still reporting (data within 30 days of the newest sample), then samples at the plant over unlabelled over upstream sites, then within 10% of the most sample days in the last 18 months, then the most all-time sample days. Same-day samples within the series are averaged.
+    *   For each plant and virus the dashboard plots a single lab + unit + site + assay series, narrowing the candidates in order: still reporting (data within 14 days of the newest sample), then samples at the plant over unlabelled over upstream sites, then within 10% of the most sample days in the last 18 months, then the most all-time sample days. Same-day samples within the series are averaged.
 *   **Non-Detects Count as Zero**:
     *   Samples where a virus wasn't found are plotted as 0, so a rare detection shows as a brief bump instead of being smoothed into a steady trend. Viruses with no detections in the selected range aren't drawn.
 *   **Robust Smoothing Algorithm**:
