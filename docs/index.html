@@ -624,7 +624,7 @@
             // to the newest sample (matches the 14-day staleness of the cards).
             currentDays: 14,
             // Bump when the shape or meaning of cached data changes.
-            cachePrefix: 'ww_data_v2_'
+            cachePrefix: 'ww_data_v3_'
         };
 
         // A search is made by its core location name, the part before any
@@ -635,7 +635,7 @@
         }
 
         function cacheKeyFor(query) {
-            return CONFIG.cachePrefix + coreName(query);
+            return CONFIG.cachePrefix + coreName(query).toLowerCase();
         }
 
         // Remove cached city data, except the entries `keep` returns true for.
@@ -756,9 +756,14 @@
         // table, so start over rather than mix snapshots. Rows come back as
         // arrays (records_format=lists, about half the JSON of objects) and are
         // turned into objects keyed by column name. `signal` cancels requests.
+        // The returned array has `.degraded = true` when series columns were
+        // unavailable, so the caller can avoid caching mixed-series data.
         async function fetchAllRecords(resourceId, query, labels, onProgress, signal) {
             const byLabel = labels && labels.length > 0;
             let columns = Object.values(CONFIG.columns);
+            // Aborted by the caller's signal, or by us if any page fails.
+            const pages = new AbortController();
+            signal?.addEventListener('abort', () => pages.abort());
             const page = offset => {
                 const params = new URLSearchParams({
                     resource_id: resourceId,
@@ -770,7 +775,7 @@
                 });
                 if (byLabel) params.set('filters', JSON.stringify({ [CONFIG.columns.location]: labels }));
                 else params.set('q', query);
-                return ckanGet(`${CONFIG.apiBase}/datastore_search?${params}`, signal);
+                return ckanGet(`${CONFIG.apiBase}/datastore_search?${params}`, pages.signal);
             };
 
             for (let attempt = 0; attempt < 2; attempt++) {
@@ -779,9 +784,10 @@
                     first = await page(0);
                 } catch (e) {
                     // A renamed or removed column: plot without series details
-                    // rather than not at all.
+                    // rather than not at all. Labs/sites can't be told apart
+                    // then, so all of a plant's rows for a virus form one series.
                     if (!e.ckan?.fields || columns.length === CONFIG.coreColumns.length) throw e;
-                    log(`Columns rejected (${JSON.stringify(e.ckan.fields)}); loading without series details.`);
+                    log(`Columns rejected (${JSON.stringify(e.ckan.fields)}); loading without series details (labs not separated).`);
                     columns = CONFIG.coreColumns.map(c => CONFIG.columns[c]);
                     first = await page(0);
                 }
@@ -795,7 +801,7 @@
                 for (let o = step; step > 0 && o < total; o += step) offsets.push(o);
                 let loaded = step;
                 if (offsets.length) onProgress?.(loaded, total);
-                const rest = await Promise.all(offsets.map(o => page(o).then(r => {
+                const rest = await Promise.all(offsets.map(o => page(o).catch(e => { pages.abort(); throw e; }).then(r => {
                     loaded += r.records.length;
                     onProgress?.(Math.min(loaded, total), total);
                     return r;
@@ -814,6 +820,7 @@
                         records.push(r);
                     }
                 }
+                records.degraded = columns.length === CONFIG.coreColumns.length;
                 return records;
             }
             throw new Error('API Error: the dataset was being updated. Please try again in a minute.');
@@ -848,9 +855,13 @@
                         const age = Date.now() - parsed.timestamp;
                         if (age < 1000 * 60 * 60 * 24) { // 24 hours
                             // Check the cached location list before unpacking every row
-                            // A typed city name ("Santa Clara") matches its facilities too.
+                            // A typed city name ("Santa Clara", no facility in
+                            // parentheses) matches its facilities too; a full
+                            // facility label must itself be in the cache.
+                            const cityOnly = selectedFacility && !selectedFacility.includes('(');
                             const wanted = selectedFacility && coreName(selectedFacility).toLowerCase();
-                            if (parsed.data && selectedFacility && parsed.data.location.some(l => l === selectedFacility || coreName(l).toLowerCase() === wanted)) {
+                            const hit = parsed.data && selectedFacility && parsed.data.location.some(l => l === selectedFacility || (cityOnly && coreName(l).toLowerCase() === wanted));
+                            if (hit) {
                                 const rehydrated = unpackRows(parsed.data);
                                 log(`Using cached data (${(age / 3600000).toFixed(1)}h old)`);
                                 const dateStr = new Date(parsed.timestamp).toLocaleString([], { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
@@ -860,25 +871,32 @@
                                 initWithData(rehydrated);
                                 return;
                             }
-                            // Selected facility not in cache, need to fetch
-                            log(`Selected facility "${selectedFacility}" not in cache, fetching...`);
+                            log(parsed.data ? `Selected facility "${selectedFacility}" not in cache, fetching...` : 'Data was not cached last time, fetching...');
                         }
                     } catch (e) { console.warn("Cache parse failed", e); }
                 }
 
                 // Fetch New - use NORMALIZED query to get all facilities for the city
-                const resourceId = await getResourceId();
-                // Fetch the city's facilities by exact label when we know them.
-                const labels = (await getLabels()).filter(l => coreName(l).toLowerCase() === normalizedQuery.toLowerCase());
+                const [resourceId, allLabels] = await Promise.all([getResourceId(), getLabels()]);
+                // Fetch the city's facilities by exact label when we know them
+                // (faster, and can't match unrelated rows); otherwise, or if
+                // the labels found nothing (renamed since the list was cached),
+                // use a full-text search.
+                const labels = allLabels.filter(l => coreName(l).toLowerCase() === normalizedQuery.toLowerCase());
                 if (labels.length && query.includes('(') && !labels.includes(query)) labels.push(query);
-                const raw = await fetchAllRecords(resourceId, normalizedQuery, labels, (done, total) => {
+                const onProgress = (done, total) => {
                     if (seq !== fetchSeq) return;
                     document.getElementById('loading-text').innerText = `Loading ${done.toLocaleString()} of ${total.toLocaleString()} records...`;
                     log(`Fetched ${done} of ${total} records...`);
-                }, abort.signal);
+                };
+                let raw = await fetchAllRecords(resourceId, normalizedQuery, labels, onProgress, abort.signal);
+                if (raw.length === 0 && labels.length) {
+                    log('No rows for the known labels; trying a full-text search.');
+                    raw = await fetchAllRecords(resourceId, normalizedQuery, null, onProgress, abort.signal);
+                }
                 if (seq !== fetchSeq) return; // a newer search started meanwhile
                 log(`Found ${raw.length} records.`);
-                if (raw.length === 0) throw new Error("No records found for this city.");
+                if (raw.length === 0) throw Object.assign(new Error("No records found for this city."), { badQuery: true });
 
                 const nowStr = new Date().toLocaleString();
                 document.getElementById('cache-status').innerText = `Live data fetched (${nowStr})`;
@@ -895,13 +913,15 @@
                 // sees when the data was fetched.
                 const entry = JSON.stringify({ timestamp: Date.now(), data: packRows(cleanData) });
                 let cachedOk = false;
-                if (entry.length <= 2400000) {
+                let notCachedWhy = raw.degraded ? 'loaded without series details' : 'too large';
+                if (!raw.degraded && entry.length <= 2400000) {
+                    notCachedWhy = 'storage full';
                     try {
                         localStorage.setItem(cacheKey, entry);
                         cachedOk = true;
                     } catch (e) {
                         try {
-                                clearCityCaches(k => k === cacheKey);
+                            clearCityCaches(k => k === cacheKey);
                             localStorage.setItem(cacheKey, entry);
                             cachedOk = true;
                             log('Cache full: cleared other cities to make room.');
@@ -909,7 +929,7 @@
                     }
                 }
                 if (!cachedOk) {
-                    log('Not cached (too large); it will be fetched again next time.');
+                    log(`Not cached (${notCachedWhy}); it will be fetched again next time.`);
                     try {
                         localStorage.setItem(cacheKey, JSON.stringify({ timestamp: Date.now(), data: null }));
                     } catch (e) { console.warn(e); }
@@ -1184,9 +1204,10 @@
                 // Check if data is "recent" (within last 14 days to be safe, though fallback handles gaps)
                 const now = new Date();
                 const diffDays = (now - latestPoint.date) / (1000 * 3600 * 24);
+                // (same staleness rule as series selection: CONFIG.currentDays)
 
                 // If data is older than 14 days, don't show as a "Recent Spike"
-                if (diffDays > 14) continue;
+                if (diffDays > CONFIG.currentDays) continue;
 
                 if (peakVal > 0 && latestPoint.val > 0) {
                     spikes.push({
@@ -1631,11 +1652,16 @@
 
         // Facility labels, loaded once and shared by autocomplete and fetchData
         // (which uses them to fetch a city by exact label). Retried if empty.
+        let labelRetries = 1;
         function getLabels() {
-            labelsPromise = labelsPromise || fetchAutocompleteLabels().then(() => {
-                if (!allAvailableLabels.length) labelsPromise = null;
-                return allAvailableLabels;
-            });
+            labelsPromise = labelsPromise || fetchAutocompleteLabels()
+                .catch(e => { console.warn('Labels unavailable', e); })
+                .then(() => {
+                    if (!Array.isArray(allAvailableLabels)) allAvailableLabels = [];
+                    // Retry an empty result once on a later search, not every time.
+                    if (!allAvailableLabels.length && labelRetries-- > 0) labelsPromise = null;
+                    return allAvailableLabels;
+                });
             return labelsPromise;
         }
 
@@ -1643,14 +1669,15 @@
             const cacheKey = 'ww_available_labels';
             const cached = localStorage.getItem(cacheKey);
 
-            if (cached) {
-                const parsed = JSON.parse(cached);
-                const age = Date.now() - parsed.timestamp;
-                if (age < 1000 * 60 * 60 * 24 * 7) { // 1 week cache
+            // Refreshed daily (like the city data): fetchData uses these labels
+            // to fetch a city, so a new or renamed facility shows up within a day.
+            try {
+                const parsed = cached && JSON.parse(cached);
+                if (parsed && Array.isArray(parsed.labels) && Date.now() - parsed.timestamp < 1000 * 60 * 60 * 24) {
                     allAvailableLabels = parsed.labels;
                     return;
                 }
-            }
+            } catch (e) { console.warn('Labels cache unreadable', e); }
 
             try {
                 const resourceId = await getResourceId();
